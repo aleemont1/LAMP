@@ -4,8 +4,21 @@
 
 #include "PacketDeserializer.hpp"
 
+bool PacketReassembler::isConsistent(const Packet &packet) const
+{
+  auto it = sessions_.find(sessionKey(packet.header.srcAddr, packet.header.messageId));
+  return it == sessions_.end() ||
+         (it->second.totalChunks == packet.header.totalChunks && packet.header.chunkIndex < it->second.totalChunks);
+}
+
 std::optional<std::vector<uint8_t>> PacketReassembler::processPacket(const Packet &packet, uint32_t currentTimestampMs)
 {
+  // Drop without touching the session: an inconsistent frame must not be stored nor refresh the inactivity timer.
+  if (!isConsistent(packet))
+  {
+    return std::nullopt;
+  }
+
   uint32_t key = sessionKey(packet.header.srcAddr, packet.header.messageId);
   uint8_t chunkIdx = packet.header.chunkIndex;
   uint8_t total = packet.header.totalChunks;
