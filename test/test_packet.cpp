@@ -681,6 +681,53 @@ static void test_reassembler_same_msgid_different_senders(void)
   TEST_ASSERT_FALSE(reassembler.isCompleted(0x02, 5));
 }
 
+/**
+ * @brief A frame of an existing session that declares a different totalChunks (e.g. a sender that rebooted and
+ * reused the message ID) must be dropped: it must not be stored nor complete the session with a hole.
+ */
+static void test_reassembler_total_chunks_mismatch_dropped(void)
+{
+  PacketReassembler reassembler;
+  uint32_t time = 1000;
+
+  reassembler.processPacket(create_chunk(70, 0, 3, "A"), time);
+
+  // Same sender and message ID, but declared as a 6-chunk message: valid on its own, inconsistent with the session.
+  auto resForeign = reassembler.processPacket(create_chunk(70, 5, 6, "X"), time);
+  TEST_ASSERT_FALSE(resForeign.has_value());
+
+  // The foreign frame must not be counted: chunk 1 of 3 must not complete the session (chunk 2 is still missing).
+  auto resB = reassembler.processPacket(create_chunk(70, 1, 3, "B"), time);
+  TEST_ASSERT_FALSE(resB.has_value());
+
+  std::vector<uint8_t> bitmap;
+  TEST_ASSERT_TRUE(reassembler.getReceivedBitmap(0, 70, bitmap));
+  TEST_ASSERT_EQUAL_UINT32(1, bitmap.size());
+  TEST_ASSERT_EQUAL_UINT8(0x03, bitmap[0]);
+
+  auto resC = reassembler.processPacket(create_chunk(70, 2, 3, "C"), time);
+  TEST_ASSERT_TRUE(resC.has_value());
+  std::string finalStr(resC.value().begin(), resC.value().end());
+  TEST_ASSERT_EQUAL_STRING("ABC", finalStr.c_str());
+}
+
+/**
+ * @brief An inconsistent frame must not refresh the session's inactivity timer.
+ */
+static void test_reassembler_total_chunks_mismatch_does_not_refresh(void)
+{
+  PacketReassembler reassembler;
+
+  reassembler.processPacket(create_chunk(71, 0, 3, "A"), 1000);
+  reassembler.processPacket(create_chunk(71, 5, 6, "X"), 3500);
+
+  // 3500 ms after the last valid chunk, with a 3000 ms limit: the session is expired.
+  reassembler.prune(4500, 3000);
+
+  std::vector<uint8_t> bitmap;
+  TEST_ASSERT_FALSE(reassembler.getReceivedBitmap(0, 71, bitmap));
+}
+
 static void test_sack_helper(void)
 {
   // Full ACK bitmap for 10 chunks -> 2 bytes (0xFF, 0xFF)
@@ -847,6 +894,8 @@ int main(void)
   RUN_TEST(test_reassembler_get_received_bitmap);
   RUN_TEST(test_reassembler_completed_messages);
   RUN_TEST(test_reassembler_same_msgid_different_senders);
+  RUN_TEST(test_reassembler_total_chunks_mismatch_dropped);
+  RUN_TEST(test_reassembler_total_chunks_mismatch_does_not_refresh);
 
   // SackHelper Tests
   RUN_TEST(test_sack_helper);

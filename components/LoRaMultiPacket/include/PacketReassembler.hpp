@@ -33,6 +33,17 @@ class PacketReassembler
   std::optional<std::vector<uint8_t>> processPacket(const Packet &packet, uint32_t currentTimestampMs);
 
   /**
+   * @brief Checks that a frame is consistent with the open session of its sender and message ID, if there is one.
+   *
+   * A frame that declares a different totalChunks than the session was opened with, or whose chunk index falls
+   * outside the session, cannot belong to that message (e.g. a sender that rebooted and reused the message ID).
+   * processPacket() drops such frames; callers that react to a frame (SACK, statistics) should check this first.
+   *
+   * @return true if there is no open session for the frame, or the frame matches it.
+   */
+  bool isConsistent(const Packet &packet) const;
+
+  /**
    * @brief Removes incomplete messages that have been inactive for longer than the timeout.
    *
    * Inactivity is measured from the last chunk received for the message (duplicates included), so a sender that is
