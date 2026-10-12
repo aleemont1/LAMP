@@ -70,4 +70,26 @@ struct ConnectionSession
   uint8_t windowSize = 1;
   uint32_t lastActivityMs = 0;
   uint32_t timeoutMs = 15000;
+
+  /**
+   * @brief Refreshes the inactivity timer on a frame from the peer of an ESTABLISHED connection.
+   *
+   * Data messages carry their own message ID (not the handshake's), so the peer address alone identifies traffic
+   * that belongs to the connection.
+   * @return true if the frame refreshed the connection.
+   */
+  bool touchOnFrameFrom(uint8_t srcAddr, uint32_t nowMs)
+  {
+    if (state != ConnectionState::ESTABLISHED || peerAddr != srcAddr)
+    {
+      return false;
+    }
+    lastActivityMs = nowMs;
+    return true;
+  }
+
+  /**
+   * @brief True when no activity was seen for longer than timeoutMs.
+   */
+  bool inactivityExpired(uint32_t nowMs) const { return nowMs - lastActivityMs > timeoutMs; }
 };

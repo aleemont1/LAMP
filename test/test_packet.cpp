@@ -682,6 +682,59 @@ static void test_reassembler_same_msgid_different_senders(void)
 }
 
 /**
+ * @brief A peer that keeps sending (a new message ID per message) must keep the connection alive, even when the
+ * total duration exceeds the inactivity timeout.
+ */
+static void test_connection_activity_refreshed_by_peer_frames(void)
+{
+  ConnectionSession conn;
+  conn.state = ConnectionState::ESTABLISHED;
+  conn.peerAddr = 0x02;
+  conn.sessionMsgId = 10;  // the handshake ID; data messages use other IDs
+  conn.timeoutMs = 15000;
+  conn.lastActivityMs = 0;
+
+  // One frame every 10 s for 60 s: 4x the inactivity timeout.
+  for (uint32_t now = 10000; now <= 60000; now += 10000)
+  {
+    TEST_ASSERT_FALSE(conn.inactivityExpired(now));
+    TEST_ASSERT_TRUE(conn.touchOnFrameFrom(0x02, now));
+  }
+  TEST_ASSERT_FALSE(conn.inactivityExpired(60000 + 15000));
+  TEST_ASSERT_TRUE(conn.inactivityExpired(60000 + 15001));
+}
+
+/**
+ * @brief Frames from another node must not keep the connection alive.
+ */
+static void test_connection_activity_not_refreshed_by_other_nodes(void)
+{
+  ConnectionSession conn;
+  conn.state = ConnectionState::ESTABLISHED;
+  conn.peerAddr = 0x02;
+  conn.timeoutMs = 15000;
+  conn.lastActivityMs = 1000;
+
+  TEST_ASSERT_FALSE(conn.touchOnFrameFrom(0x03, 12000));
+  TEST_ASSERT_EQUAL_UINT32(1000, conn.lastActivityMs);
+  TEST_ASSERT_TRUE(conn.inactivityExpired(16001));
+}
+
+/**
+ * @brief Only an ESTABLISHED connection is refreshed by data frames (SYN_RCVD is promoted elsewhere).
+ */
+static void test_connection_activity_ignored_when_not_established(void)
+{
+  ConnectionSession conn;
+  conn.state = ConnectionState::CLOSED;
+  conn.peerAddr = 0x02;
+  conn.lastActivityMs = 500;
+
+  TEST_ASSERT_FALSE(conn.touchOnFrameFrom(0x02, 9000));
+  TEST_ASSERT_EQUAL_UINT32(500, conn.lastActivityMs);
+}
+
+/**
  * @brief After forgetSender() a message with the same (srcAddr, messageId) as a completed one is delivered again:
  * a sender that rebooted and reused the ID must not be taken for a duplicate.
  */
@@ -989,6 +1042,9 @@ int main(void)
   RUN_TEST(test_reassembler_completed_entry_expires);
   RUN_TEST(test_reassembler_completed_entry_within_ttl_suppresses_duplicate);
   RUN_TEST(test_message_id_from_random_is_never_zero);
+  RUN_TEST(test_connection_activity_refreshed_by_peer_frames);
+  RUN_TEST(test_connection_activity_not_refreshed_by_other_nodes);
+  RUN_TEST(test_connection_activity_ignored_when_not_established);
   RUN_TEST(test_reassembler_total_chunks_mismatch_dropped);
   RUN_TEST(test_reassembler_total_chunks_mismatch_does_not_refresh);
 

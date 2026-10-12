@@ -477,7 +477,7 @@ void LoRaProtocol::update(uint32_t currentTimestampMs)
   // Inactivity / Idle Timeout Check for active connections
   if (connection_.state == ConnectionState::ESTABLISHED || connection_.state == ConnectionState::SYN_RCVD)
   {
-    if (currentTimestampMs - connection_.lastActivityMs > connection_.timeoutMs)
+    if (connection_.inactivityExpired(currentTimestampMs))
     {
       ESP_LOGW(TAG, "Connection session MsgID %u TIMED OUT due to inactivity (%u ms). Closing connection.",
                connection_.sessionMsgId, (unsigned)(currentTimestampMs - connection_.lastActivityMs));
@@ -703,9 +703,9 @@ void LoRaProtocol::handleIncomingPacket(const Packet &packet, uint32_t currentTi
     connection_.lastActivityMs = currentTimestampMs;
     stats_.connEstablished++;
   }
-  else if (connection_.state == ConnectionState::ESTABLISHED && connection_.sessionMsgId == msgId && connection_.peerAddr == senderAddr)
+  else
   {
-    connection_.lastActivityMs = currentTimestampMs;
+    connection_.touchOnFrameFrom(senderAddr, currentTimestampMs);
   }
 
   if (packet.header.flags & FLAG_ACK)
