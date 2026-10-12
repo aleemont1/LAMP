@@ -13,7 +13,9 @@ Block C (loss emulation, mirrors the hardware bench) is run separately.
 Block D (related-work baselines): Block A's channel, SNR axis, N and seeds, with MPLR (Chen et al. 2019) and the
     LoRaMesher large-transfer service (Sole et al. 2026; "LoRaMesher" = MIN_TIMEOUT 20 s, "Tight" = timeout
     derived like the S&W baseline). Written to ns3_campaign_D.csv so Block A is not re-run.
-Run: python3 run_campaign_ns3.py [A|B|C|D|AB] [--limit N]   (needs a built scratch/lora-multipacket-sim)
+Block E: the same baselines on Block B's channels (URBAN/RURAL/WATER and the stress channels), same seeds, so the
+    shadowing draws are paired with LAMP and S&W. Written to ns3_campaign_E.csv.
+Run: python3 run_campaign_ns3.py [A|B|C|D|E|AB] [--limit N]   (needs a built scratch/lora-multipacket-sim)
 """
 import itertools
 import math
@@ -68,6 +70,14 @@ def jobs_D():
     for snr, sf, mode, seed in itertools.product(SNRS, SFS, MODES_D, SEEDS):
         d = distance_for_snr(snr, *FREE_SPACE)
         yield ("D", d, mode, sf, "LOS", seed, ["--sigma=0", "--m=50"])
+
+
+def jobs_E():
+    for label, (env, n, pl1km, extra) in CHANNELS_B.items():
+        for snr, sf, mode, seed in itertools.product(SNRS, SFS, MODES_D, SEEDS):
+            d = distance_for_snr(snr, n, pl1km)
+            if d <= MAX_DIST_M:
+                yield (label, d, mode, sf, env, seed, extra)
 
 
 def jobs_B():
@@ -127,3 +137,5 @@ if __name__ == "__main__":
         campaign("C", jobs_C(), limit)
     if "D" in which:
         campaign("D", jobs_D(), limit)
+    if "E" in which:
+        campaign("E", jobs_E(), limit)
