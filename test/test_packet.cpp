@@ -640,7 +640,7 @@ static void test_reassembler_completed_messages(void)
   PacketReassembler reassembler;
   uint32_t time = 1000;
 
-  TEST_ASSERT_FALSE(reassembler.isCompleted(0, 80));
+  TEST_ASSERT_FALSE(reassembler.isCompleted(0, 80, time));
 
   // Complete a session
   reassembler.processPacket(create_chunk(80, 0, 2, "A"), time);
@@ -648,12 +648,12 @@ static void test_reassembler_completed_messages(void)
   TEST_ASSERT_TRUE(res.has_value());
 
   // Mark it completed
-  reassembler.markCompleted(0, 80);
-  TEST_ASSERT_TRUE(reassembler.isCompleted(0, 80));
+  reassembler.markCompleted(0, 80, time);
+  TEST_ASSERT_TRUE(reassembler.isCompleted(0, 80, time));
 
   // Verify that it is cleared on reset
   reassembler.reset();
-  TEST_ASSERT_FALSE(reassembler.isCompleted(0, 80));
+  TEST_ASSERT_FALSE(reassembler.isCompleted(0, 80, time));
 }
 
 /**
@@ -676,9 +676,99 @@ static void test_reassembler_same_msgid_different_senders(void)
 
   auto res = reassembler.processPacket(create_chunk(5, 1, 2, "B", 0x01), time);
   TEST_ASSERT_TRUE(res.has_value());
-  reassembler.markCompleted(0x01, 5);
-  TEST_ASSERT_TRUE(reassembler.isCompleted(0x01, 5));
-  TEST_ASSERT_FALSE(reassembler.isCompleted(0x02, 5));
+  reassembler.markCompleted(0x01, 5, time);
+  TEST_ASSERT_TRUE(reassembler.isCompleted(0x01, 5, time));
+  TEST_ASSERT_FALSE(reassembler.isCompleted(0x02, 5, time));
+}
+
+/**
+ * @brief After forgetSender() a message with the same (srcAddr, messageId) as a completed one is delivered again:
+ * a sender that rebooted and reused the ID must not be taken for a duplicate.
+ */
+static void test_reassembler_forget_sender_clears_completed_history(void)
+{
+  PacketReassembler reassembler;
+  uint32_t time = 1000;
+
+  reassembler.markCompleted(0x01, 7, time);
+  reassembler.markCompleted(0x02, 7, time);
+  TEST_ASSERT_TRUE(reassembler.isCompleted(0x01, 7, time));
+
+  reassembler.forgetSender(0x01);
+
+  TEST_ASSERT_FALSE(reassembler.isCompleted(0x01, 7, time));
+  TEST_ASSERT_TRUE(reassembler.isCompleted(0x02, 7, time));  // other senders are untouched
+}
+
+/**
+ * @brief forgetSender() also drops the partial session of that sender, so frames of the new message do not
+ * merge with chunks of the previous incarnation.
+ */
+static void test_reassembler_forget_sender_drops_partial_sessions(void)
+{
+  PacketReassembler reassembler;
+  uint32_t time = 1000;
+
+  reassembler.processPacket(create_chunk(9, 0, 2, "A", 0x01), time);
+  reassembler.processPacket(create_chunk(9, 0, 2, "Y", 0x02), time);
+
+  reassembler.forgetSender(0x01);
+
+  std::vector<uint8_t> bitmap;
+  TEST_ASSERT_FALSE(reassembler.getReceivedBitmap(0x01, 9, bitmap));
+  TEST_ASSERT_TRUE(reassembler.getReceivedBitmap(0x02, 9, bitmap));
+
+  // The new message starts from scratch: chunk 1 alone must not complete it.
+  auto res = reassembler.processPacket(create_chunk(9, 1, 2, "B", 0x01), time);
+  TEST_ASSERT_FALSE(res.has_value());
+}
+
+/**
+ * @brief A completed entry older than COMPLETED_HISTORY_TTL_MS no longer suppresses a message with the same key.
+ */
+static void test_reassembler_completed_entry_expires(void)
+{
+  PacketReassembler reassembler;
+  const uint32_t ttl = LoRaMultiPacketConfig::COMPLETED_HISTORY_TTL_MS;
+  uint32_t time = 5000;
+
+  reassembler.markCompleted(0x01, 11, time);
+
+  TEST_ASSERT_TRUE(reassembler.isCompleted(0x01, 11, time + ttl));       // exactly at the limit: still a duplicate
+  TEST_ASSERT_FALSE(reassembler.isCompleted(0x01, 11, time + ttl + 1));  // expired
+
+  // The expired entry does not block a new message with the same key.
+  auto first = reassembler.processPacket(create_chunk(11, 0, 2, "A", 0x01), time + ttl + 1);
+  TEST_ASSERT_FALSE(first.has_value());
+  auto done = reassembler.processPacket(create_chunk(11, 1, 2, "B", 0x01), time + ttl + 1);
+  TEST_ASSERT_TRUE(done.has_value());
+}
+
+/**
+ * @brief A completed entry inside the window keeps suppressing the duplicate (e.g. a retransmission after a lost SACK),
+ * also across a prune() call.
+ */
+static void test_reassembler_completed_entry_within_ttl_suppresses_duplicate(void)
+{
+  PacketReassembler reassembler;
+  const uint32_t ttl = LoRaMultiPacketConfig::COMPLETED_HISTORY_TTL_MS;
+  uint32_t time = 5000;
+
+  reassembler.markCompleted(0x01, 12, time);
+  reassembler.prune(time + ttl / 2, 1000);
+
+  TEST_ASSERT_TRUE(reassembler.isCompleted(0x01, 12, time + ttl / 2));
+}
+
+/**
+ * @brief Message IDs derived from a random word are never 0 (reserved), and a fresh boot does not start at 1.
+ */
+static void test_message_id_from_random_is_never_zero(void)
+{
+  TEST_ASSERT_EQUAL_UINT16(1, messageIdFromRandom(0x00000000));
+  TEST_ASSERT_EQUAL_UINT16(1, messageIdFromRandom(0xABCD0000));  // low 16 bits are zero
+  TEST_ASSERT_EQUAL_UINT16(0x1234, messageIdFromRandom(0xDEAD1234));
+  TEST_ASSERT_EQUAL_UINT16(0xFFFF, messageIdFromRandom(0xFFFFFFFF));
 }
 
 /**
@@ -894,6 +984,11 @@ int main(void)
   RUN_TEST(test_reassembler_get_received_bitmap);
   RUN_TEST(test_reassembler_completed_messages);
   RUN_TEST(test_reassembler_same_msgid_different_senders);
+  RUN_TEST(test_reassembler_forget_sender_clears_completed_history);
+  RUN_TEST(test_reassembler_forget_sender_drops_partial_sessions);
+  RUN_TEST(test_reassembler_completed_entry_expires);
+  RUN_TEST(test_reassembler_completed_entry_within_ttl_suppresses_duplicate);
+  RUN_TEST(test_message_id_from_random_is_never_zero);
   RUN_TEST(test_reassembler_total_chunks_mismatch_dropped);
   RUN_TEST(test_reassembler_total_chunks_mismatch_does_not_refresh);
 

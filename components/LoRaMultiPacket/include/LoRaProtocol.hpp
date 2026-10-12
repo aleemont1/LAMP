@@ -29,8 +29,12 @@ class LoRaProtocol
 
   /**
    * @brief Constructor accepting the specific SX1262 driver, HAL pointer, and physical IRQ pin.
+   * @param randomSource Source of the random word that seeds the message ID counter (default: the hardware RNG).
+   *        The counter starts at a random value on each boot so that a restarted node does not reuse the IDs the
+   *        receiver still remembers.
    */
-  explicit LoRaProtocol(SX1262 *radio, RadioLibHal *hal, uint32_t irqPin);
+  explicit LoRaProtocol(SX1262 *radio, RadioLibHal *hal, uint32_t irqPin,
+                        std::function<uint32_t()> randomSource = nullptr);
 
   /**
    * @brief Sets the local node address (0x01..0xFE).

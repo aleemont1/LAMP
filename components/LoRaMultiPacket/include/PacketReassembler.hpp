@@ -77,14 +77,23 @@ class PacketReassembler
   bool getReceivedBitmap(uint8_t srcAddr, uint16_t messageId, std::vector<uint8_t> &bitmapOut) const;
 
   /**
-   * @brief Checks if a message from a given sender was recently completed.
+   * @brief Checks if a message from a given sender was completed within COMPLETED_HISTORY_TTL_MS.
+   *
+   * An older entry is not a duplicate any more: the sender may have rebooted and reused the message ID.
    */
-  bool isCompleted(uint8_t srcAddr, uint16_t messageId) const;
+  bool isCompleted(uint8_t srcAddr, uint16_t messageId, uint32_t currentTimestampMs) const;
 
   /**
-   * @brief Marks a message from a given sender as completed, adding it to the history.
+   * @brief Marks a message from a given sender as completed, adding it to the history with its timestamp.
    */
-  void markCompleted(uint8_t srcAddr, uint16_t messageId);
+  void markCompleted(uint8_t srcAddr, uint16_t messageId, uint32_t currentTimestampMs);
+
+  /**
+   * @brief Forgets everything known about a sender: its completed messages and its partial sessions.
+   *
+   * Called when the sender opens a new connection, which means it may have restarted and reuse old message IDs.
+   */
+  void forgetSender(uint8_t srcAddr);
 
  private:
   static constexpr size_t MAX_COMPLETED_HISTORY = LoRaMultiPacketConfig::MAX_COMPLETED_HISTORY;
@@ -113,7 +122,13 @@ class PacketReassembler
   }
 
   std::map<uint32_t, ReassemblySession> sessions_;
-  std::vector<uint32_t> completedMessages_;
+
+  struct CompletedEntry
+  {
+    uint32_t key;
+    uint32_t completedTime;
+  };
+  std::vector<CompletedEntry> completedMessages_;
 
   static std::vector<uint8_t> reconstruct(const ReassemblySession &session);
 };
