@@ -62,6 +62,23 @@ class PacketValidator
    */
   static std::optional<ValidationError> validate(const Packet &packet);
 
+  /**
+   * @brief True for a broadcast frame that requests an acknowledgment or carries connection control flags.
+   *
+   * Such frames are meaningless (there is no single peer to answer) and would make every node in range reply at
+   * once, so receivers drop them.
+   */
+  static bool isBroadcastWithReliabilityFlags(const PacketHeader &header)
+  {
+    constexpr uint8_t kFlags = FLAG_ACK_REQ | FLAG_CONN_REQ | FLAG_CONN_ACK | FLAG_CONN_NACK;
+    return header.dstAddr == ADDRESS_BROADCAST && (header.flags & kFlags) != 0;
+  }
+
+  /**
+   * @brief True if a message to dstAddr may be sent with acknowledgments (i.e. dstAddr is not broadcast).
+   */
+  static bool canSendReliablyTo(uint8_t dstAddr) { return dstAddr != ADDRESS_BROADCAST; }
+
  private:
   static constexpr size_t MIN_PACKET_SIZE =
       HEADER_SIZE + sizeof(PacketPayload) + CRC_SIZE;

@@ -5,6 +5,8 @@
 #include <cstring>
 #include <random>
 
+#include "PacketValidator.hpp"
+
 #ifdef ESP_PLATFORM
 #include "esp_log.h"
 #include "esp_random.h"
@@ -41,6 +43,12 @@ LoRaProtocol::LoRaProtocol(SX1262 *radio, RadioLibHal *hal, uint32_t irqPin, std
 
 bool LoRaProtocol::connect(uint8_t targetAddress, uint32_t timeoutMs)
 {
+  if (!PacketValidator::canSendReliablyTo(targetAddress))
+  {
+    ESP_LOGE(TAG, "connect() needs a unicast target: a broadcast SYN would be dropped by every receiver");
+    return false;
+  }
+
   uint16_t msgId = nextMessageId_++;
   if (nextMessageId_ == 0)
   {
@@ -204,6 +212,12 @@ bool LoRaProtocol::send(uint8_t targetAddress, const std::vector<uint8_t> &data,
 {
   if (data.empty())
   {
+    return false;
+  }
+
+  if (reliable && !PacketValidator::canSendReliablyTo(targetAddress))
+  {
+    ESP_LOGE(TAG, "Reliable send to broadcast rejected: there is no single peer to acknowledge. Use a unicast target.");
     return false;
   }
 
@@ -574,6 +588,15 @@ void LoRaProtocol::handleIncomingPacket(const Packet &packet, uint32_t currentTi
     ESP_LOGI(TAG, "Dropping packet not addressed to this node: dstAddr=0x%02X (myAddr=0x%02X, srcAddr=0x%02X)",
              (unsigned)packet.header.dstAddr, (unsigned)nodeAddress_, (unsigned)packet.header.srcAddr);
     stats_.packetsDroppedAddress++;
+    radio_->startReceive();
+    return;
+  }
+
+  // Broadcast frames cannot be acknowledged or open connections: drop them without answering.
+  if (PacketValidator::isBroadcastWithReliabilityFlags(packet.header))
+  {
+    ESP_LOGW(TAG, "Dropping broadcast frame with ACK_REQ/connection flags (0x%02X) from 0x%02X",
+             (unsigned)packet.header.flags, (unsigned)packet.header.srcAddr);
     radio_->startReceive();
     return;
   }
