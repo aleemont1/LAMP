@@ -697,6 +697,54 @@ static void test_reassembler_same_msgid_different_senders(void)
 }
 
 /**
+ * @brief A new session is refused when the free heap cannot hold its chunks plus the margin, and accepted when it can.
+ */
+static void test_reassembler_admission_checks_free_heap(void)
+{
+  PacketReassembler reassembler;
+  const uint8_t chunks = 20;
+  const size_t need = PacketReassembler::sessionBytes(chunks) + LoRaMultiPacketConfig::RX_HEAP_MARGIN_BYTES;
+
+  TEST_ASSERT_TRUE(need > chunks * sizeof(Packet));  // at least the chunks themselves
+
+  TEST_ASSERT_EQUAL(PacketReassembler::Admission::NO_MEMORY, reassembler.admit(0x01, 5, chunks, need - 1));
+  TEST_ASSERT_EQUAL(PacketReassembler::Admission::OK, reassembler.admit(0x01, 5, chunks, need));
+  TEST_ASSERT_TRUE(PacketReassembler::sessionBytes(40) > PacketReassembler::sessionBytes(20));
+}
+
+/**
+ * @brief With every session slot taken a new session is refused (BUSY), but frames of an open session still pass,
+ * whatever the heap.
+ */
+static void test_reassembler_admission_full_table_and_open_session(void)
+{
+  PacketReassembler reassembler;
+  const size_t plenty = 1u << 20;
+
+  for (uint16_t id = 1; id <= LoRaMultiPacketConfig::MAX_CONCURRENT_SESSIONS; ++id)
+  {
+    TEST_ASSERT_EQUAL(PacketReassembler::Admission::OK, reassembler.admit(0x01, id, 3, plenty));
+    reassembler.processPacket(create_chunk(id, 0, 3, "A", 0x01), 1000);
+  }
+
+  TEST_ASSERT_EQUAL(PacketReassembler::Admission::TABLE_FULL, reassembler.admit(0x01, 99, 3, plenty));
+  TEST_ASSERT_EQUAL(PacketReassembler::Admission::TABLE_FULL, reassembler.admitConnection(plenty));
+  TEST_ASSERT_EQUAL(PacketReassembler::Admission::OK, reassembler.admit(0x01, 1, 3, 0));  // already open
+}
+
+/**
+ * @brief A connection (SYN) does not know the message size yet: it needs a free slot and the heap margin only.
+ */
+static void test_reassembler_admit_connection_needs_slot_and_margin(void)
+{
+  PacketReassembler reassembler;
+  TEST_ASSERT_EQUAL(PacketReassembler::Admission::NO_MEMORY,
+                    reassembler.admitConnection(LoRaMultiPacketConfig::RX_HEAP_MARGIN_BYTES - 1));
+  TEST_ASSERT_EQUAL(PacketReassembler::Admission::OK,
+                    reassembler.admitConnection(LoRaMultiPacketConfig::RX_HEAP_MARGIN_BYTES));
+}
+
+/**
  * @brief A message split with a negotiated payload size of 100 B produces 10 chunks of at most 100 B, all of
  * which pass the receiver's validation and reassemble to the original message.
  */
@@ -1139,6 +1187,9 @@ int main(void)
   RUN_TEST(test_reassembler_completed_entry_expires);
   RUN_TEST(test_reassembler_completed_entry_within_ttl_suppresses_duplicate);
   RUN_TEST(test_message_id_from_random_is_never_zero);
+  RUN_TEST(test_reassembler_admission_checks_free_heap);
+  RUN_TEST(test_reassembler_admission_full_table_and_open_session);
+  RUN_TEST(test_reassembler_admit_connection_needs_slot_and_margin);
   RUN_TEST(test_split_with_negotiated_payload_size);
   RUN_TEST(test_connection_payload_size_for_destination);
   RUN_TEST(test_broadcast_with_reliability_or_connection_flags_is_rejected);

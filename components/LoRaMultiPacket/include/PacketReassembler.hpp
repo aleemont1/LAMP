@@ -88,6 +88,34 @@ class PacketReassembler
    */
   void markCompleted(uint8_t srcAddr, uint16_t messageId, uint32_t currentTimestampMs);
 
+  /// Outcome of an admission check.
+  enum class Admission : uint8_t
+  {
+    OK,
+    TABLE_FULL,  ///< every session slot is in use
+    NO_MEMORY    ///< the free heap cannot hold the session plus the margin
+  };
+
+  /**
+   * @brief Heap needed to reassemble a message of totalChunks chunks: the chunks as stored in the session map plus
+   * the reassembled message built at completion.
+   */
+  static size_t sessionBytes(uint8_t totalChunks);
+
+  /**
+   * @brief Decides whether a frame may open a new session, given the free heap.
+   *
+   * A frame of an already open session is always OK (its memory is accounted for). Otherwise a slot must be free and
+   * the heap must hold sessionBytes(totalChunks) plus RX_HEAP_MARGIN_BYTES.
+   */
+  Admission admit(uint8_t srcAddr, uint16_t messageId, uint8_t totalChunks, size_t freeHeapBytes) const;
+
+  /**
+   * @brief Decides whether a connection request may be accepted. The SYN does not carry the message size, so only a
+   * free session slot and the heap margin are checked; the size is checked by admit() on the first data frame.
+   */
+  Admission admitConnection(size_t freeHeapBytes) const;
+
   /**
    * @brief Forgets everything known about a sender: its completed messages and its partial sessions.
    *
