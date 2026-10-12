@@ -330,17 +330,32 @@ static void test_validator_invalid_payload_size_too_large(void)
   TEST_ASSERT_EQUAL(ValidationError::Type::INVALID_PAYLOAD_SIZE, err.value().type);
 }
 
-static void test_validator_invalid_payload_size_non_final_partial(void)
+static void test_validator_invalid_payload_size_non_final_empty(void)
 {
   Packet p = create_valid_base_packet();
   p.header.totalChunks = 2;
   p.header.chunkIndex = 0;
-  p.header.payloadSize = 10;  // Non-final chunk must be full size (LORA_MAX_PAYLOAD_SIZE)
+  p.header.payloadSize = 0;  // A non-final chunk carries data (its size is the negotiated payload size)
   p.header.flags = 0;
   p.calculateCRC();
   auto err = PacketValidator::validate(p);
   TEST_ASSERT_TRUE(err.has_value());
   TEST_ASSERT_EQUAL(ValidationError::Type::INVALID_PAYLOAD_SIZE, err.value().type);
+}
+
+/**
+ * @brief With a negotiated payload size below the maximum, non-final chunks are shorter than
+ * LORA_MAX_PAYLOAD_SIZE and must still be accepted.
+ */
+static void test_validator_accepts_non_final_chunk_of_negotiated_size(void)
+{
+  Packet p = create_valid_base_packet();
+  p.header.totalChunks = 2;
+  p.header.chunkIndex = 0;
+  p.header.payloadSize = 100;
+  p.header.flags = 0;
+  p.calculateCRC();
+  TEST_ASSERT_FALSE(PacketValidator::validate(p).has_value());
 }
 
 static void test_validator_crc_mismatch(void)
@@ -679,6 +694,52 @@ static void test_reassembler_same_msgid_different_senders(void)
   reassembler.markCompleted(0x01, 5, time);
   TEST_ASSERT_TRUE(reassembler.isCompleted(0x01, 5, time));
   TEST_ASSERT_FALSE(reassembler.isCompleted(0x02, 5, time));
+}
+
+/**
+ * @brief A message split with a negotiated payload size of 100 B produces 10 chunks of at most 100 B, all of
+ * which pass the receiver's validation and reassemble to the original message.
+ */
+static void test_split_with_negotiated_payload_size(void)
+{
+  std::vector<uint8_t> data(1000);
+  for (size_t i = 0; i < data.size(); ++i)
+  {
+    data[i] = static_cast<uint8_t>(i * 7);
+  }
+
+  auto packets = PacketSerializer::splitVectorToPackets(data, 5, 0x01, 0x02, 100);
+  TEST_ASSERT_EQUAL_size_t(10, packets.size());
+
+  PacketReassembler reassembler;
+  std::optional<std::vector<uint8_t>> out;
+  for (const auto &p : packets)
+  {
+    TEST_ASSERT_TRUE(p.header.payloadSize <= 100);
+    TEST_ASSERT_FALSE(PacketValidator::validate(p).has_value());
+    out = reassembler.processPacket(p, 1000);
+  }
+  TEST_ASSERT_TRUE(out.has_value());
+  TEST_ASSERT_TRUE(out.value() == data);
+}
+
+/**
+ * @brief The chunk size is the negotiated one only while connected to that peer; otherwise the maximum, and never
+ * outside [1, LORA_MAX_PAYLOAD_SIZE].
+ */
+static void test_connection_payload_size_for_destination(void)
+{
+  ConnectionSession conn;
+  TEST_ASSERT_EQUAL_size_t(LORA_MAX_PAYLOAD_SIZE, conn.payloadSizeFor(0x02));  // CLOSED
+
+  conn.state = ConnectionState::ESTABLISHED;
+  conn.peerAddr = 0x02;
+  conn.negotiatedPayloadSize = 100;
+  TEST_ASSERT_EQUAL_size_t(100, conn.payloadSizeFor(0x02));
+  TEST_ASSERT_EQUAL_size_t(LORA_MAX_PAYLOAD_SIZE, conn.payloadSizeFor(0x03));  // another destination
+
+  conn.negotiatedPayloadSize = 0;
+  TEST_ASSERT_EQUAL_size_t(LORA_MAX_PAYLOAD_SIZE, conn.payloadSizeFor(0x02));
 }
 
 /**
@@ -1056,7 +1117,8 @@ int main(void)
   RUN_TEST(test_validator_invalid_total_chunks);
   RUN_TEST(test_validator_invalid_chunk_index);
   RUN_TEST(test_validator_invalid_payload_size_too_large);
-  RUN_TEST(test_validator_invalid_payload_size_non_final_partial);
+  RUN_TEST(test_validator_invalid_payload_size_non_final_empty);
+  RUN_TEST(test_validator_accepts_non_final_chunk_of_negotiated_size);
   RUN_TEST(test_validator_crc_mismatch);
   RUN_TEST(test_validator_bypass_ack_flags);
 
@@ -1077,6 +1139,8 @@ int main(void)
   RUN_TEST(test_reassembler_completed_entry_expires);
   RUN_TEST(test_reassembler_completed_entry_within_ttl_suppresses_duplicate);
   RUN_TEST(test_message_id_from_random_is_never_zero);
+  RUN_TEST(test_split_with_negotiated_payload_size);
+  RUN_TEST(test_connection_payload_size_for_destination);
   RUN_TEST(test_broadcast_with_reliability_or_connection_flags_is_rejected);
   RUN_TEST(test_reliable_send_requires_unicast_destination);
   RUN_TEST(test_connection_activity_refreshed_by_peer_frames);

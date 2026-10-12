@@ -39,7 +39,8 @@ enum class ConnNackReason : uint8_t
 struct SynMetadata
 {
   uint8_t requestedPayloadSize = LORA_MAX_PAYLOAD_SIZE;  ///< Maximum requested payload bytes per chunk.
-  uint8_t windowSize = 1;                                ///< Sliding window size (chunks).
+  uint8_t windowSize = 1;                                ///< Reserved: the burst has no window. Kept (always 1) so the
+                                                         ///< 4-byte SYN layout stays compatible.
   uint16_t timeoutMs = 5000;                             ///< Maximum inactivity timeout requested.
 };
 
@@ -51,7 +52,7 @@ struct SynMetadata
 struct SynAckMetadata
 {
   uint8_t acceptedPayloadSize = LORA_MAX_PAYLOAD_SIZE;  ///< Negotiated payload bytes per chunk.
-  uint8_t windowSize = 1;                               ///< Negotiated window size.
+  uint8_t windowSize = 1;                               ///< Reserved, echoes the SYN (the burst has no window).
   uint16_t reserved = 0;                                ///< Reserved alignment padding.
 };
 
@@ -65,9 +66,9 @@ struct ConnectionSession
 {
   ConnectionState state = ConnectionState::CLOSED;
   uint16_t sessionMsgId = 0;
-  uint8_t peerAddr = ADDRESS_UNASSIGNED;  ///< Peer node address for active session
-  uint8_t negotiatedPayloadSize = LORA_MAX_PAYLOAD_SIZE;
-  uint8_t windowSize = 1;
+  uint8_t peerAddr = ADDRESS_UNASSIGNED;                  ///< Peer node address for active session
+  uint8_t negotiatedPayloadSize = LORA_MAX_PAYLOAD_SIZE;  ///< Payload bytes per chunk, see payloadSizeFor().
+  uint8_t windowSize = 1;                                 ///< Reserved (no window in the burst); not used.
   uint32_t lastActivityMs = 0;
   uint32_t timeoutMs = 15000;
 
@@ -86,6 +87,20 @@ struct ConnectionSession
     }
     lastActivityMs = nowMs;
     return true;
+  }
+
+  /**
+   * @brief Payload bytes per chunk to use towards dstAddr: the negotiated size while ESTABLISHED with that peer,
+   * LORA_MAX_PAYLOAD_SIZE otherwise (connectionless modes, other destinations).
+   */
+  size_t payloadSizeFor(uint8_t dstAddr) const
+  {
+    if (state != ConnectionState::ESTABLISHED || peerAddr != dstAddr || negotiatedPayloadSize == 0 ||
+        negotiatedPayloadSize > LORA_MAX_PAYLOAD_SIZE)
+    {
+      return LORA_MAX_PAYLOAD_SIZE;
+    }
+    return negotiatedPayloadSize;
   }
 
   /**

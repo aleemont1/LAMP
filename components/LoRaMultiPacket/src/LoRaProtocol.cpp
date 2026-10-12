@@ -227,7 +227,10 @@ bool LoRaProtocol::send(uint8_t targetAddress, const std::vector<uint8_t> &data,
     nextMessageId_ = 1;
   }
 
-  std::vector<Packet> packets = PacketSerializer::splitVectorToPackets(data, msgId, nodeAddress_, targetAddress);
+  // Negotiated in the handshake when connected to this peer; the maximum otherwise.
+  const size_t chunkPayloadSize = connection_.payloadSizeFor(targetAddress);
+
+  std::vector<Packet> packets = PacketSerializer::splitVectorToPackets(data, msgId, nodeAddress_, targetAddress, chunkPayloadSize);
   if (packets.empty())
   {
     return false;
@@ -237,7 +240,7 @@ bool LoRaProtocol::send(uint8_t targetAddress, const std::vector<uint8_t> &data,
   {
     packets.back().header.flags |= FLAG_ACK_REQ;
     packets.back().calculateCRC();
-    return sendReliable(packets);
+    return sendReliable(packets, chunkPayloadSize);
   }
 
   return sendUnreliable(packets);
@@ -277,12 +280,12 @@ bool LoRaProtocol::sendUnreliable(const std::vector<Packet> &packets)
   return true;
 }
 
-bool LoRaProtocol::sendReliable(const std::vector<Packet> &packets)
+bool LoRaProtocol::sendReliable(const std::vector<Packet> &packets, size_t chunkPayloadSize)
 {
   uint16_t msgId = packets[0].header.messageId;
   uint8_t targetAddr = packets[0].header.dstAddr;
   uint8_t totalChunks = static_cast<uint8_t>(packets.size());
-  uint32_t ackTimeoutMs = calculateAckTimeoutMs(totalChunks);
+  uint32_t ackTimeoutMs = calculateAckTimeoutMs(totalChunks, chunkPayloadSize);
 
   ESP_LOGI(TAG, "Sending MsgID %u (%u chunks) [Reliable Mode, Timeout=%ums]",
            msgId, (unsigned)totalChunks, (unsigned)ackTimeoutMs);
@@ -372,9 +375,9 @@ bool LoRaProtocol::sendReliable(const std::vector<Packet> &packets)
   }
 }
 
-uint32_t LoRaProtocol::calculateAckTimeoutMs(size_t totalChunks) const
+uint32_t LoRaProtocol::calculateAckTimeoutMs(size_t totalChunks, size_t chunkPayloadSize) const
 {
-  size_t maxPacketLen = HEADER_SIZE + LORA_MAX_PAYLOAD_SIZE + CRC_SIZE;
+  size_t maxPacketLen = HEADER_SIZE + chunkPayloadSize + CRC_SIZE;
   uint32_t toaDataMs = radio_->getTimeOnAir(maxPacketLen) / 1000;
   size_t sackLen = HEADER_SIZE + ((totalChunks + 7) / 8) + CRC_SIZE;
   uint32_t toaSackMs = radio_->getTimeOnAir(sackLen) / 1000;

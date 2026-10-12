@@ -68,15 +68,14 @@ std::optional<ValidationError> PacketValidator::validateHeader(
             std::to_string(LORA_MAX_PAYLOAD_SIZE) + ")");
   }
 
-  // Logical check: if not the last chunk, payload must be full
+  // Logical check: a non-final chunk carries data. Its size is the payload size negotiated in the handshake
+  // (at most LORA_MAX_PAYLOAD_SIZE), which a stateless validator cannot know.
   bool isLastChunk = (header.chunkIndex == header.totalChunks - 1);
-  if (!isLastChunk && header.payloadSize != LORA_MAX_PAYLOAD_SIZE)
+  if (!isLastChunk && header.payloadSize == 0)
   {
     return ValidationError(
         ValidationError::Type::INVALID_PAYLOAD_SIZE,
-        "Non-final chunk must have full payload (" +
-            std::to_string(LORA_MAX_PAYLOAD_SIZE) + " bytes), got " +
-            std::to_string(header.payloadSize));
+        "Non-final chunk must carry payload, got 0 bytes");
   }
 
   return std::nullopt;

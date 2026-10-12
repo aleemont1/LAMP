@@ -148,10 +148,10 @@ class LoRaProtocol
 
   // Internal helper methods for transmission
   bool sendUnreliable(const std::vector<Packet> &packets);
-  bool sendReliable(const std::vector<Packet> &packets);
+  bool sendReliable(const std::vector<Packet> &packets, size_t chunkPayloadSize);
   bool waitForSack(uint8_t targetAddr, uint16_t msgId, uint32_t timeoutMs, std::vector<uint8_t> &sackBitmapOut);
   bool retransmitMissingChunks(const std::vector<Packet> &packets, const std::vector<uint8_t> &missingIndices);
-  uint32_t calculateAckTimeoutMs(size_t totalChunks) const;
+  uint32_t calculateAckTimeoutMs(size_t totalChunks, size_t chunkPayloadSize = LORA_MAX_PAYLOAD_SIZE) const;
   int transmitPacket(const Packet &packet, const char *logPrefix);
 
   // Internal helper methods for reception
