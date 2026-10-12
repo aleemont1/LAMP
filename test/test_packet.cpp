@@ -745,6 +745,40 @@ static void test_reassembler_admit_connection_needs_slot_and_margin(void)
 }
 
 /**
+ * @brief All non-final chunks of a message have the same size, and the final one is not larger: a frame that breaks
+ * this cannot belong to the message and is dropped without being stored.
+ */
+static void test_reassembler_rejects_chunks_of_inconsistent_size(void)
+{
+  PacketReassembler reassembler;
+  std::vector<uint8_t> data(450, 0x5A);
+  auto packets = PacketSerializer::splitVectorToPackets(data, 21, 0x01, 0x02, 100);  // 5 chunks: 4 x 100 + 50
+  TEST_ASSERT_EQUAL_size_t(5, packets.size());
+
+  reassembler.processPacket(packets[0], 1000);
+
+  Packet odd = packets[1];  // non-final chunk with another size
+  odd.header.payloadSize = 90;
+  odd.calculateCRC();
+  TEST_ASSERT_FALSE(reassembler.isConsistent(odd));
+  reassembler.processPacket(odd, 1000);
+
+  Packet bigLast = packets[4];  // final chunk larger than the stride
+  bigLast.header.payloadSize = 120;
+  bigLast.calculateCRC();
+  TEST_ASSERT_FALSE(reassembler.isConsistent(bigLast));
+
+  // The genuine chunks still reassemble the message (the odd frame was not stored).
+  std::optional<std::vector<uint8_t>> out;
+  for (size_t i = 1; i < packets.size(); ++i)
+  {
+    out = reassembler.processPacket(packets[i], 1000);
+  }
+  TEST_ASSERT_TRUE(out.has_value());
+  TEST_ASSERT_TRUE(out.value() == data);
+}
+
+/**
  * @brief A message split with a negotiated payload size of 100 B produces 10 chunks of at most 100 B, all of
  * which pass the receiver's validation and reassemble to the original message.
  */
@@ -1190,6 +1224,7 @@ int main(void)
   RUN_TEST(test_reassembler_admission_checks_free_heap);
   RUN_TEST(test_reassembler_admission_full_table_and_open_session);
   RUN_TEST(test_reassembler_admit_connection_needs_slot_and_margin);
+  RUN_TEST(test_reassembler_rejects_chunks_of_inconsistent_size);
   RUN_TEST(test_split_with_negotiated_payload_size);
   RUN_TEST(test_connection_payload_size_for_destination);
   RUN_TEST(test_broadcast_with_reliability_or_connection_flags_is_rejected);

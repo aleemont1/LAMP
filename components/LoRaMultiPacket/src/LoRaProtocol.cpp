@@ -21,15 +21,6 @@ static const char *TAG = "LoRaProto";
 static const char *TAG = "LoRaProto";
 #endif
 
-static uint32_t defaultRandomSource()
-{
-#ifdef ESP_PLATFORM
-  return esp_random();
-#else
-  return std::random_device{}();
-#endif
-}
-
 static size_t defaultFreeHeap()
 {
 #ifdef ESP_PLATFORM
@@ -48,10 +39,45 @@ LoRaProtocol::LoRaProtocol(SX1262 *radio, RadioLibHal *hal, uint32_t irqPin, std
       dropPacketCallback_(nullptr),
       freeHeapProvider_(defaultFreeHeap),
       verbose_(false),
-      nextMessageId_(messageIdFromRandom(randomSource ? randomSource() : defaultRandomSource())),
+      randomSource_(std::move(randomSource)),
+      nextMessageId_(1),
+      messageIdSeeded_(false),
       phyBuffer_{0}
 {
   connection_.state = ConnectionState::CLOSED;
+}
+
+uint16_t LoRaProtocol::allocateMessageId()
+{
+  if (!messageIdSeeded_)
+  {
+    uint32_t seed;
+    if (randomSource_)
+    {
+      seed = randomSource_();
+    }
+    else
+    {
+#ifdef ESP_PLATFORM
+      // SX1262 noise source (two bytes; it leaves the radio in standby, the next TX/RX restarts it) mixed with the
+      // ESP32 generator, which is only partly random without WiFi/BT.
+      uint32_t radioWord = radio_->randomByte();
+      radioWord = (radioWord << 8) | radio_->randomByte();
+      seed = (radioWord << 16) ^ radioWord ^ esp_random();
+#else
+      seed = std::random_device{}();
+#endif
+    }
+    nextMessageId_ = messageIdFromRandom(seed);
+    messageIdSeeded_ = true;
+  }
+
+  uint16_t id = nextMessageId_++;
+  if (nextMessageId_ == 0)
+  {
+    nextMessageId_ = 1;
+  }
+  return id;
 }
 
 bool LoRaProtocol::connect(uint8_t targetAddress, uint32_t timeoutMs)
@@ -62,11 +88,7 @@ bool LoRaProtocol::connect(uint8_t targetAddress, uint32_t timeoutMs)
     return false;
   }
 
-  uint16_t msgId = nextMessageId_++;
-  if (nextMessageId_ == 0)
-  {
-    nextMessageId_ = 1;
-  }
+  uint16_t msgId = allocateMessageId();
 
   connection_.state = ConnectionState::SYN_SENT;
   connection_.sessionMsgId = msgId;
@@ -234,11 +256,7 @@ bool LoRaProtocol::send(uint8_t targetAddress, const std::vector<uint8_t> &data,
     return false;
   }
 
-  uint16_t msgId = nextMessageId_++;
-  if (nextMessageId_ == 0)
-  {
-    nextMessageId_ = 1;
-  }
+  uint16_t msgId = allocateMessageId();
 
   // Negotiated in the handshake when connected to this peer; the maximum otherwise.
   const size_t chunkPayloadSize = connection_.payloadSizeFor(targetAddress);
