@@ -682,6 +682,41 @@ static void test_reassembler_same_msgid_different_senders(void)
 }
 
 /**
+ * @brief A broadcast frame must not ask for an acknowledgment nor carry connection control: there is no single
+ * receiver to answer, and every node would reply at once.
+ */
+static void test_broadcast_with_reliability_or_connection_flags_is_rejected(void)
+{
+  const uint8_t offending[] = {FLAG_ACK_REQ, FLAG_CONN_REQ, FLAG_CONN_ACK, FLAG_CONN_NACK,
+                               static_cast<uint8_t>(FLAG_CONN_REQ | FLAG_CONN_ACK)};
+  for (uint8_t flags : offending)
+  {
+    PacketHeader h{};
+    h.dstAddr = ADDRESS_BROADCAST;
+    h.flags = flags;
+    TEST_ASSERT_TRUE(PacketValidator::isBroadcastWithReliabilityFlags(h));
+
+    h.dstAddr = 0x02;  // the same flags are fine on a unicast frame
+    TEST_ASSERT_FALSE(PacketValidator::isBroadcastWithReliabilityFlags(h));
+  }
+
+  PacketHeader plain{};
+  plain.dstAddr = ADDRESS_BROADCAST;
+  plain.flags = 0;
+  TEST_ASSERT_FALSE(PacketValidator::isBroadcastWithReliabilityFlags(plain));
+}
+
+/**
+ * @brief Reliable delivery needs a unicast destination.
+ */
+static void test_reliable_send_requires_unicast_destination(void)
+{
+  TEST_ASSERT_FALSE(PacketValidator::canSendReliablyTo(ADDRESS_BROADCAST));
+  TEST_ASSERT_TRUE(PacketValidator::canSendReliablyTo(0x01));
+  TEST_ASSERT_TRUE(PacketValidator::canSendReliablyTo(0xFE));
+}
+
+/**
  * @brief A peer that keeps sending (a new message ID per message) must keep the connection alive, even when the
  * total duration exceeds the inactivity timeout.
  */
@@ -1042,6 +1077,8 @@ int main(void)
   RUN_TEST(test_reassembler_completed_entry_expires);
   RUN_TEST(test_reassembler_completed_entry_within_ttl_suppresses_duplicate);
   RUN_TEST(test_message_id_from_random_is_never_zero);
+  RUN_TEST(test_broadcast_with_reliability_or_connection_flags_is_rejected);
+  RUN_TEST(test_reliable_send_requires_unicast_destination);
   RUN_TEST(test_connection_activity_refreshed_by_peer_frames);
   RUN_TEST(test_connection_activity_not_refreshed_by_other_nodes);
   RUN_TEST(test_connection_activity_ignored_when_not_established);

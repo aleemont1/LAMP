@@ -55,7 +55,8 @@ class LoRaProtocol
   bool connect(uint8_t targetAddress, uint32_t timeoutMs = LoRaMultiPacketConfig::DEFAULT_SYN_TIMEOUT_MS);
 
   /**
-   * @brief Initiates a 3-way handshake with default broadcast/unassigned target. Overload for backwards compatibility.
+   * @brief Initiates a 3-way handshake with the broadcast target. Overload kept for backwards compatibility;
+   * it always fails, because a handshake needs a unicast target.
    */
   bool connect(uint32_t timeoutMs = LoRaMultiPacketConfig::DEFAULT_SYN_TIMEOUT_MS)
   {
@@ -79,11 +80,13 @@ class LoRaProtocol
 
   /**
    * @brief Sends a payload to a specific target node. Blocking.
+   * @note reliable = true requires a unicast target; with ADDRESS_BROADCAST it returns false without transmitting.
    */
   bool send(uint8_t targetAddress, const std::vector<uint8_t> &data, bool reliable = false);
 
   /**
-   * @brief Sends a payload to default broadcast target. Overload for backwards compatibility.
+   * @brief Sends a payload to the default broadcast target. Overload for backwards compatibility.
+   * @note With reliable = true this fails: a broadcast cannot be acknowledged. Use send(targetAddress, ...).
    */
   bool send(const std::vector<uint8_t> &data, bool reliable = false)
   {
