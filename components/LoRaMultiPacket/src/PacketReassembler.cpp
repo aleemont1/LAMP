@@ -7,8 +7,43 @@
 bool PacketReassembler::isConsistent(const Packet &packet) const
 {
   auto it = sessions_.find(sessionKey(packet.header.srcAddr, packet.header.messageId));
-  return it == sessions_.end() ||
-         (it->second.totalChunks == packet.header.totalChunks && packet.header.chunkIndex < it->second.totalChunks);
+  if (it == sessions_.end())
+  {
+    return true;
+  }
+
+  const ReassemblySession &session = it->second;
+  if (session.totalChunks != packet.header.totalChunks || packet.header.chunkIndex >= session.totalChunks)
+  {
+    return false;
+  }
+
+  // Chunk sizes: all non-final chunks of a message have the size negotiated in the handshake, and the final one is
+  // not larger. The (stateless) validator cannot check this, so the first chunk received sets the stride.
+  const uint8_t lastIdx = session.totalChunks - 1;
+  size_t stride = 0;  // 0 = not known yet
+  for (const auto &entry : session.chunks)
+  {
+    if (entry.first != lastIdx)
+    {
+      stride = entry.second.header.payloadSize;
+      break;
+    }
+  }
+  if (packet.header.chunkIndex != lastIdx)
+  {
+    if (stride == 0)
+    {
+      stride = packet.header.payloadSize;
+    }
+    else if (packet.header.payloadSize != stride)
+    {
+      return false;
+    }
+    auto last = session.chunks.find(lastIdx);
+    return last == session.chunks.end() || last->second.header.payloadSize <= stride;
+  }
+  return stride == 0 || packet.header.payloadSize <= stride;
 }
 
 std::optional<std::vector<uint8_t>> PacketReassembler::processPacket(const Packet &packet, uint32_t currentTimestampMs)

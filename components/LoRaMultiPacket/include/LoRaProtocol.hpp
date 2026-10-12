@@ -30,9 +30,10 @@ class LoRaProtocol
 
   /**
    * @brief Constructor accepting the specific SX1262 driver, HAL pointer, and physical IRQ pin.
-   * @param randomSource Source of the random word that seeds the message ID counter (default: the hardware RNG).
-   *        The counter starts at a random value on each boot so that a restarted node does not reuse the IDs the
-   *        receiver still remembers.
+   * @param randomSource Source of the random word that seeds the message ID counter (default: the SX1262 random
+   *        generator mixed with the ESP32 one). The counter is seeded on first use, not here, because the radio is
+   *        not initialised yet when the object is constructed. It starts at a random value on each boot so that a
+   *        restarted node does not reuse the IDs the receiver still remembers.
    */
   explicit LoRaProtocol(SX1262 *radio, RadioLibHal *hal, uint32_t irqPin,
                         std::function<uint32_t()> randomSource = nullptr);
@@ -143,8 +144,13 @@ class LoRaProtocol
   FreeHeapProvider freeHeapProvider_;
   ProtocolStats stats_;
   bool verbose_;
+  std::function<uint32_t()> randomSource_;  ///< optional override of the message ID seed (tests)
   uint16_t nextMessageId_;
+  bool messageIdSeeded_;
   uint8_t phyBuffer_[LoRaMultiPacketConfig::PHY_BUFFER_SIZE];  ///< Shared buffer for hardware I/O
+
+  // Returns the next message ID (never 0), seeding the counter with a random value on first use.
+  uint16_t allocateMessageId();
 
   // Internal helper methods for 3-Way Handshake
   void sendSyn(uint8_t targetAddr, uint16_t msgId, const SynMetadata &syn);
