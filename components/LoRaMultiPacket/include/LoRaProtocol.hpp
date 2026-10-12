@@ -26,6 +26,7 @@ class LoRaProtocol
   using OnConnectionRequestCallback = std::function<bool(SynMetadata &syn)>;
   using YieldCallback = std::function<void()>;
   using DropPacketCallback = std::function<bool(const Packet &packet)>;
+  using FreeHeapProvider = std::function<size_t()>;
 
   /**
    * @brief Constructor accepting the specific SX1262 driver, HAL pointer, and physical IRQ pin.
@@ -103,6 +104,11 @@ class LoRaProtocol
   void setYieldCallback(YieldCallback callback);
   void setDropPacketCallback(DropPacketCallback callback);
 
+  /**
+   * @brief Overrides the source of the free-heap figure used for receiver admission (default: esp_get_free_heap_size()).
+   */
+  void setFreeHeapProvider(FreeHeapProvider provider);
+
   void setVerbose(bool enable);
 
   struct ProtocolStats
@@ -134,6 +140,7 @@ class LoRaProtocol
   OnConnectionRequestCallback onConnRequest_;
   YieldCallback yieldCallback_;
   DropPacketCallback dropPacketCallback_;
+  FreeHeapProvider freeHeapProvider_;
   ProtocolStats stats_;
   bool verbose_;
   uint16_t nextMessageId_;

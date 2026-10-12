@@ -1,15 +1,18 @@
 #include "LoRaProtocol.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <utility>
 
 #include "PacketValidator.hpp"
 
 #ifdef ESP_PLATFORM
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_system.h"
 static const char *TAG = "LoRaProto";
 #else
 #define ESP_LOGI(tag, format, ...) printf("INFO  [%s]: " format "\n", tag, ##__VA_ARGS__)
@@ -27,6 +30,15 @@ static uint32_t defaultRandomSource()
 #endif
 }
 
+static size_t defaultFreeHeap()
+{
+#ifdef ESP_PLATFORM
+  return esp_get_free_heap_size();
+#else
+  return SIZE_MAX;
+#endif
+}
+
 LoRaProtocol::LoRaProtocol(SX1262 *radio, RadioLibHal *hal, uint32_t irqPin, std::function<uint32_t()> randomSource)
     : radio_(radio),
       hal_(hal),
@@ -34,6 +46,7 @@ LoRaProtocol::LoRaProtocol(SX1262 *radio, RadioLibHal *hal, uint32_t irqPin, std
       nodeAddress_(ADDRESS_UNASSIGNED),
       onConnRequest_(nullptr),
       dropPacketCallback_(nullptr),
+      freeHeapProvider_(defaultFreeHeap),
       verbose_(false),
       nextMessageId_(messageIdFromRandom(randomSource ? randomSource() : defaultRandomSource())),
       phyBuffer_{0}
@@ -656,6 +669,16 @@ void LoRaProtocol::handleIncomingPacket(const Packet &packet, uint32_t currentTi
 	return;
       }
 
+      // Failure Mode: no session slot or heap left. Answer BUSY instead of accepting a transfer we cannot hold.
+      auto admission = reassembler_.admitConnection(freeHeapProvider_());
+      if (admission != PacketReassembler::Admission::OK)
+      {
+	ESP_LOGW(TAG, "SYN rejected for MsgID %u from 0x%02X: %s", msgId, (unsigned)senderAddr,
+	         admission == PacketReassembler::Admission::TABLE_FULL ? "session table full" : "not enough free heap");
+	sendConnNack(senderAddr, msgId, ConnNackReason::BUSY);
+	return;
+      }
+
       SynMetadata synReq{};
       if (packet.header.payloadSize >= sizeof(SynMetadata))
       {
@@ -756,6 +779,18 @@ void LoRaProtocol::handleIncomingPacket(const Packet &packet, uint32_t currentTi
 
     if (!isAlreadyCompleted)
     {
+      // Opening a session needs a free slot and enough heap for the whole message: refuse it explicitly instead of
+      // dropping the chunk silently (the sender gets no SACK and gives up after its retry budget).
+      auto admission = reassembler_.admit(senderAddr, msgId, packet.header.totalChunks, freeHeapProvider_());
+      if (admission != PacketReassembler::Admission::OK)
+      {
+	ESP_LOGW(TAG, "Refusing MsgID %u from 0x%02X (%u chunks): %s", (unsigned)msgId, (unsigned)senderAddr,
+	         (unsigned)packet.header.totalChunks,
+	         admission == PacketReassembler::Admission::TABLE_FULL ? "session table full" : "not enough free heap");
+	radio_->startReceive();
+	return;
+      }
+
       payloadOpt = reassembler_.processPacket(packet, currentTimestampMs);
       if (payloadOpt.has_value())
       {
@@ -825,6 +860,11 @@ void LoRaProtocol::setYieldCallback(YieldCallback callback)
 void LoRaProtocol::setDropPacketCallback(DropPacketCallback callback)
 {
   dropPacketCallback_ = callback;
+}
+
+void LoRaProtocol::setFreeHeapProvider(FreeHeapProvider provider)
+{
+  freeHeapProvider_ = provider ? std::move(provider) : FreeHeapProvider(defaultFreeHeap);
 }
 
 void LoRaProtocol::setVerbose(bool enable)

@@ -123,6 +123,39 @@ void PacketReassembler::markCompleted(uint8_t srcAddr, uint16_t messageId, uint3
   completedMessages_.push_back({key, currentTimestampMs});
 }
 
+size_t PacketReassembler::sessionBytes(uint8_t totalChunks)
+{
+  return static_cast<size_t>(totalChunks) *
+         (sizeof(Packet) + LoRaMultiPacketConfig::RX_CHUNK_NODE_OVERHEAD_BYTES + LORA_MAX_PAYLOAD_SIZE);
+}
+
+PacketReassembler::Admission PacketReassembler::admit(uint8_t srcAddr, uint16_t messageId, uint8_t totalChunks,
+                                                      size_t freeHeapBytes) const
+{
+  if (sessions_.count(sessionKey(srcAddr, messageId)) != 0)
+  {
+    return Admission::OK;
+  }
+  if (sessions_.size() >= MAX_CONCURRENT_MESSAGES)
+  {
+    return Admission::TABLE_FULL;
+  }
+  if (freeHeapBytes < sessionBytes(totalChunks) + LoRaMultiPacketConfig::RX_HEAP_MARGIN_BYTES)
+  {
+    return Admission::NO_MEMORY;
+  }
+  return Admission::OK;
+}
+
+PacketReassembler::Admission PacketReassembler::admitConnection(size_t freeHeapBytes) const
+{
+  if (sessions_.size() >= MAX_CONCURRENT_MESSAGES)
+  {
+    return Admission::TABLE_FULL;
+  }
+  return (freeHeapBytes < LoRaMultiPacketConfig::RX_HEAP_MARGIN_BYTES) ? Admission::NO_MEMORY : Admission::OK;
+}
+
 void PacketReassembler::forgetSender(uint8_t srcAddr)
 {
   auto fromSender = [srcAddr](uint32_t key)
