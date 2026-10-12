@@ -29,6 +29,10 @@ constexpr uint32_t POLL_SLEEP_DELAY_MS = 10;
 // Session and Reassembly Limits
 constexpr size_t MAX_CONCURRENT_SESSIONS = 10;
 constexpr size_t MAX_COMPLETED_HISTORY = 16;
+// How long a completed message keeps suppressing duplicates. A duplicate can only come from the sender's retry
+// window after a lost SACK: (MAX_RETRIES + 1) SACK timeouts, about 100 s for a full-size frame at SF12/125 kHz
+// (SACK timeout 16.8 s). Rounded up; raise it for narrower bandwidths or a larger MAX_RETRIES.
+constexpr uint32_t COMPLETED_HISTORY_TTL_MS = 120000;
 
 // Airtime Safety Multipliers
 constexpr double ACK_TIMEOUT_SAFETY_FACTOR = 1.5;

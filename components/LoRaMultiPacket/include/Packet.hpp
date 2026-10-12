@@ -57,6 +57,18 @@ constexpr uint8_t FLAG_CONN_NACK = 0x40;  ///< Connection Rejected: session refu
  */
 constexpr uint8_t ADDRESS_UNASSIGNED = 0x00;  ///< Unassigned / P2P Unaddressed Mode
 constexpr uint8_t ADDRESS_BROADCAST = 0xFF;   ///< Broadcast address (processed by all receiving nodes)
+
+/**
+ * @brief Maps a random word to a valid message ID (0 is reserved).
+ *
+ * Used to start the message ID counter at a random value on each boot, so that a rebooted sender does not reuse
+ * the IDs the receiver still remembers.
+ */
+inline uint16_t messageIdFromRandom(uint32_t random)
+{
+  uint16_t id = static_cast<uint16_t>(random & 0xFFFF);
+  return (id == 0) ? 1 : id;
+}
 /** @} */
 
 #pragma pack(push, 1)  // Ensure no compiler padding is inserted between fields

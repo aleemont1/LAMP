@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <random>
 
 #ifdef ESP_PLATFORM
 #include "esp_log.h"
+#include "esp_random.h"
 static const char *TAG = "LoRaProto";
 #else
 #define ESP_LOGI(tag, format, ...) printf("INFO  [%s]: " format "\n", tag, ##__VA_ARGS__)
@@ -14,7 +16,16 @@ static const char *TAG = "LoRaProto";
 static const char *TAG = "LoRaProto";
 #endif
 
-LoRaProtocol::LoRaProtocol(SX1262 *radio, RadioLibHal *hal, uint32_t irqPin)
+static uint32_t defaultRandomSource()
+{
+#ifdef ESP_PLATFORM
+  return esp_random();
+#else
+  return std::random_device{}();
+#endif
+}
+
+LoRaProtocol::LoRaProtocol(SX1262 *radio, RadioLibHal *hal, uint32_t irqPin, std::function<uint32_t()> randomSource)
     : radio_(radio),
       hal_(hal),
       irqPin_(irqPin),
@@ -22,7 +33,7 @@ LoRaProtocol::LoRaProtocol(SX1262 *radio, RadioLibHal *hal, uint32_t irqPin)
       onConnRequest_(nullptr),
       dropPacketCallback_(nullptr),
       verbose_(false),
-      nextMessageId_(1),
+      nextMessageId_(messageIdFromRandom(randomSource ? randomSource() : defaultRandomSource())),
       phyBuffer_{0}
 {
   connection_.state = ConnectionState::CLOSED;
@@ -642,6 +653,10 @@ void LoRaProtocol::handleIncomingPacket(const Packet &packet, uint32_t currentTi
 
       if (accept)
       {
+	// A new connection means the sender may have restarted: its old message IDs must not be taken for duplicates
+	// and its partial sessions must not absorb the frames of the new message.
+	reassembler_.forgetSender(senderAddr);
+
 	connection_.state = ConnectionState::SYN_RCVD;
 	connection_.sessionMsgId = msgId;
 	connection_.peerAddr = senderAddr;
@@ -699,7 +714,7 @@ void LoRaProtocol::handleIncomingPacket(const Packet &packet, uint32_t currentTi
   }
   else
   {
-    bool isAlreadyCompleted = reassembler_.isCompleted(senderAddr, msgId);
+    bool isAlreadyCompleted = reassembler_.isCompleted(senderAddr, msgId, currentTimestampMs);
     bool justCompleted = false;
 
     std::optional<std::vector<uint8_t>> payloadOpt;
@@ -718,7 +733,7 @@ void LoRaProtocol::handleIncomingPacket(const Packet &packet, uint32_t currentTi
       payloadOpt = reassembler_.processPacket(packet, currentTimestampMs);
       if (payloadOpt.has_value())
       {
-	reassembler_.markCompleted(senderAddr, msgId);
+	reassembler_.markCompleted(senderAddr, msgId, currentTimestampMs);
 	stats_.packetsRx++;
 	justCompleted = true;
       }
