@@ -89,14 +89,15 @@ static bool ParseMode(const std::string &m, ModeSpec &s)
         s.threeWay = false; s.teardown = true; s.batchSize = 40;
         return true;
     }
-    if (m == "LoRaMesher" || m == "LoRaMesherTight") {
+    if (m == "LoRaMesher" || m == "LoRaMesherTight" || m == "LoRaMesherR5") {
         // Large and reliable transfer service: stop-and-wait with one ACK per chunk, 11 B header, 222 B packets,
-        // SYNC/ACK handshake, MAX_TIMEOUTS = 10; MIN_TIMEOUT = 20 s unless the "Tight" variant is requested.
+        // SYNC/ACK handshake, MAX_TIMEOUTS = 10 (5 in the "R5" variant); MIN_TIMEOUT = 20 s unless the "Tight" variant is requested.
         s = {};
         s.stateful = true; s.proto = Proto::STOP_AND_WAIT;
         s.headerBytes = 11; s.crcBytes = 0; s.chunkPayload = 222 - 11; s.synPayload = 0;
-        s.threeWay = false; s.maxRetries = 10;
-        s.fixedTimeoutMs = (m == "LoRaMesher") ? 20000.0 : 0.0;
+        s.threeWay = false;
+        s.maxRetries = (m == "LoRaMesherR5") ? MAX_RETRIES : 10;  // "R5": LAMP's R_max, for an equal-budget comparison
+        s.fixedTimeoutMs = (m == "LoRaMesherTight") ? 0.0 : 20000.0;
         return true;
     }
     if (m.rfind("SW", 0) == 0) {

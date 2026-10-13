@@ -34,10 +34,12 @@ STYLE = {  # mode -> (label, color, linestyle)
     "SWBase": ("Stop-and-wait (base timeout)", "#2ca02c", ":"),
     "SWOpt": ("Stop-and-wait (tight timeout)", "#ff7f0e", ":"),
     "MPLR": ("MPLR (batch 40, BVACK)", "#9467bd", "-."),
-    "LoRaMesher": ("LoRaMesher transfer (MIN_TIMEOUT 20 s)", "#8c564b", "-."),
+    "LoRaMesher": ("LoRaMesher transfer (10 retries)", "#8c564b", "--"),
     "LoRaMesherTight": ("LoRaMesher transfer (tight timeout)", "#e377c2", "-."),
+    "LoRaMesherR5": ("LoRaMesher transfer (5 retries)", "#17becf", "--"),
 }
-RELATED = ("Mode3", "Mode4", "SWBase", "MPLR", "LoRaMesher", "LoRaMesherTight")
+# LoRaMesherTight differs from LoRaMesher only in time, not in delivery, so the PDR figures leave it out
+RELATED = ("Mode3", "Mode4", "SWBase", "MPLR", "LoRaMesher", "LoRaMesherR5")
 
 
 def load(name):

@@ -12,7 +12,7 @@ Output: data/ns3_campaign_{A,B}.csv, one line per run:
 Block C (loss emulation, mirrors the hardware bench) is run separately.
 Block D (related-work baselines): Block A's channel, SNR axis, N and seeds, with MPLR (Chen et al. 2019) and the
     LoRaMesher large-transfer service (Sole et al. 2026; "LoRaMesher" = MIN_TIMEOUT 20 s, "Tight" = timeout
-    derived like the S&W baseline). Written to ns3_campaign_D.csv so Block A is not re-run.
+    derived like the S&W baseline, "R5" = 20 s timeout but 5 retries like LAMP). Written to ns3_campaign_D.csv so Block A is not re-run.
 Block E: the same baselines on Block B's channels (URBAN/RURAL/WATER and the stress channels), same seeds, so the
     shadowing draws are paired with LAMP and S&W. Written to ns3_campaign_E.csv.
 Run: python3 run_campaign_ns3.py [A|B|C|D|E|AB] [--limit N]   (needs a built scratch/lora-multipacket-sim)
@@ -41,7 +41,7 @@ MAX_DIST_M = 100_000.0
 MODES_A = ["Mode1", "Mode2", "Mode3", "Mode4", "SWBase", "SWOpt", "SWBaseConn", "SWOptConn"]
 MODES_B = ["Mode1", "Mode3", "Mode4", "SWBase"]
 MODES_STRESS = ["Mode4", "SWBase"]
-MODES_D = ["MPLR", "LoRaMesher", "LoRaMesherTight"]
+MODES_D = ["MPLR", "LoRaMesher", "LoRaMesherTight", "LoRaMesherR5"]
 
 # label -> (--env, n, PL(1 km) dB, extra sim args); n/PL mirror the simulator defaults and are used only
 # to map a target SNR to a distance.
