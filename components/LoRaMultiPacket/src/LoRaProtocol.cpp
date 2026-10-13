@@ -704,6 +704,15 @@ void LoRaProtocol::handleIncomingPacket(const Packet &packet, uint32_t currentTi
 
     std::optional<std::vector<uint8_t>> payloadOpt;
 
+    if (!isAlreadyCompleted && !reassembler_.isConsistent(packet))
+    {
+      ESP_LOGW(TAG, "Dropping chunk %u of MsgID %u from 0x%02X: totalChunks=%u does not match the open session",
+               (unsigned)packet.header.chunkIndex, (unsigned)msgId, (unsigned)senderAddr,
+               (unsigned)packet.header.totalChunks);
+      radio_->startReceive();
+      return;
+    }
+
     if (!isAlreadyCompleted)
     {
       payloadOpt = reassembler_.processPacket(packet, currentTimestampMs);
