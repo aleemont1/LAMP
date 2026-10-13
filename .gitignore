@@ -94,7 +94,6 @@ sdkconfig.*
 tools/
 plots/
 *.csv
-src/*Test.cpp
 .venv/
 venv/
 
