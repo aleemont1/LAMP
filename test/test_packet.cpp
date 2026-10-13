@@ -330,17 +330,32 @@ static void test_validator_invalid_payload_size_too_large(void)
   TEST_ASSERT_EQUAL(ValidationError::Type::INVALID_PAYLOAD_SIZE, err.value().type);
 }
 
-static void test_validator_invalid_payload_size_non_final_partial(void)
+static void test_validator_invalid_payload_size_non_final_empty(void)
 {
   Packet p = create_valid_base_packet();
   p.header.totalChunks = 2;
   p.header.chunkIndex = 0;
-  p.header.payloadSize = 10;  // Non-final chunk must be full size (LORA_MAX_PAYLOAD_SIZE)
+  p.header.payloadSize = 0;  // A non-final chunk carries data (its size is the negotiated payload size)
   p.header.flags = 0;
   p.calculateCRC();
   auto err = PacketValidator::validate(p);
   TEST_ASSERT_TRUE(err.has_value());
   TEST_ASSERT_EQUAL(ValidationError::Type::INVALID_PAYLOAD_SIZE, err.value().type);
+}
+
+/**
+ * @brief With a negotiated payload size below the maximum, non-final chunks are shorter than
+ * LORA_MAX_PAYLOAD_SIZE and must still be accepted.
+ */
+static void test_validator_accepts_non_final_chunk_of_negotiated_size(void)
+{
+  Packet p = create_valid_base_packet();
+  p.header.totalChunks = 2;
+  p.header.chunkIndex = 0;
+  p.header.payloadSize = 100;
+  p.header.flags = 0;
+  p.calculateCRC();
+  TEST_ASSERT_FALSE(PacketValidator::validate(p).has_value());
 }
 
 static void test_validator_crc_mismatch(void)
@@ -640,7 +655,7 @@ static void test_reassembler_completed_messages(void)
   PacketReassembler reassembler;
   uint32_t time = 1000;
 
-  TEST_ASSERT_FALSE(reassembler.isCompleted(0, 80));
+  TEST_ASSERT_FALSE(reassembler.isCompleted(0, 80, time));
 
   // Complete a session
   reassembler.processPacket(create_chunk(80, 0, 2, "A"), time);
@@ -648,12 +663,12 @@ static void test_reassembler_completed_messages(void)
   TEST_ASSERT_TRUE(res.has_value());
 
   // Mark it completed
-  reassembler.markCompleted(0, 80);
-  TEST_ASSERT_TRUE(reassembler.isCompleted(0, 80));
+  reassembler.markCompleted(0, 80, time);
+  TEST_ASSERT_TRUE(reassembler.isCompleted(0, 80, time));
 
   // Verify that it is cleared on reset
   reassembler.reset();
-  TEST_ASSERT_FALSE(reassembler.isCompleted(0, 80));
+  TEST_ASSERT_FALSE(reassembler.isCompleted(0, 80, time));
 }
 
 /**
@@ -676,9 +691,315 @@ static void test_reassembler_same_msgid_different_senders(void)
 
   auto res = reassembler.processPacket(create_chunk(5, 1, 2, "B", 0x01), time);
   TEST_ASSERT_TRUE(res.has_value());
-  reassembler.markCompleted(0x01, 5);
-  TEST_ASSERT_TRUE(reassembler.isCompleted(0x01, 5));
-  TEST_ASSERT_FALSE(reassembler.isCompleted(0x02, 5));
+  reassembler.markCompleted(0x01, 5, time);
+  TEST_ASSERT_TRUE(reassembler.isCompleted(0x01, 5, time));
+  TEST_ASSERT_FALSE(reassembler.isCompleted(0x02, 5, time));
+}
+
+/**
+ * @brief A new session is refused when the free heap cannot hold its chunks plus the margin, and accepted when it can.
+ */
+static void test_reassembler_admission_checks_free_heap(void)
+{
+  PacketReassembler reassembler;
+  const uint8_t chunks = 20;
+  const size_t need = PacketReassembler::sessionBytes(chunks) + LoRaMultiPacketConfig::RX_HEAP_MARGIN_BYTES;
+
+  TEST_ASSERT_TRUE(need > chunks * sizeof(Packet));  // at least the chunks themselves
+
+  TEST_ASSERT_EQUAL(PacketReassembler::Admission::NO_MEMORY, reassembler.admit(0x01, 5, chunks, need - 1));
+  TEST_ASSERT_EQUAL(PacketReassembler::Admission::OK, reassembler.admit(0x01, 5, chunks, need));
+  TEST_ASSERT_TRUE(PacketReassembler::sessionBytes(40) > PacketReassembler::sessionBytes(20));
+}
+
+/**
+ * @brief With every session slot taken a new session is refused (BUSY), but frames of an open session still pass,
+ * whatever the heap.
+ */
+static void test_reassembler_admission_full_table_and_open_session(void)
+{
+  PacketReassembler reassembler;
+  const size_t plenty = 1u << 20;
+
+  for (uint16_t id = 1; id <= LoRaMultiPacketConfig::MAX_CONCURRENT_SESSIONS; ++id)
+  {
+    TEST_ASSERT_EQUAL(PacketReassembler::Admission::OK, reassembler.admit(0x01, id, 3, plenty));
+    reassembler.processPacket(create_chunk(id, 0, 3, "A", 0x01), 1000);
+  }
+
+  TEST_ASSERT_EQUAL(PacketReassembler::Admission::TABLE_FULL, reassembler.admit(0x01, 99, 3, plenty));
+  TEST_ASSERT_EQUAL(PacketReassembler::Admission::TABLE_FULL, reassembler.admitConnection(plenty));
+  TEST_ASSERT_EQUAL(PacketReassembler::Admission::OK, reassembler.admit(0x01, 1, 3, 0));  // already open
+}
+
+/**
+ * @brief A connection (SYN) does not know the message size yet: it needs a free slot and the heap margin only.
+ */
+static void test_reassembler_admit_connection_needs_slot_and_margin(void)
+{
+  PacketReassembler reassembler;
+  TEST_ASSERT_EQUAL(PacketReassembler::Admission::NO_MEMORY,
+                    reassembler.admitConnection(LoRaMultiPacketConfig::RX_HEAP_MARGIN_BYTES - 1));
+  TEST_ASSERT_EQUAL(PacketReassembler::Admission::OK,
+                    reassembler.admitConnection(LoRaMultiPacketConfig::RX_HEAP_MARGIN_BYTES));
+}
+
+/**
+ * @brief All non-final chunks of a message have the same size, and the final one is not larger: a frame that breaks
+ * this cannot belong to the message and is dropped without being stored.
+ */
+static void test_reassembler_rejects_chunks_of_inconsistent_size(void)
+{
+  PacketReassembler reassembler;
+  std::vector<uint8_t> data(450, 0x5A);
+  auto packets = PacketSerializer::splitVectorToPackets(data, 21, 0x01, 0x02, 100);  // 5 chunks: 4 x 100 + 50
+  TEST_ASSERT_EQUAL_size_t(5, packets.size());
+
+  reassembler.processPacket(packets[0], 1000);
+
+  Packet odd = packets[1];  // non-final chunk with another size
+  odd.header.payloadSize = 90;
+  odd.calculateCRC();
+  TEST_ASSERT_FALSE(reassembler.isConsistent(odd));
+  reassembler.processPacket(odd, 1000);
+
+  Packet bigLast = packets[4];  // final chunk larger than the stride
+  bigLast.header.payloadSize = 120;
+  bigLast.calculateCRC();
+  TEST_ASSERT_FALSE(reassembler.isConsistent(bigLast));
+
+  // The genuine chunks still reassemble the message (the odd frame was not stored).
+  std::optional<std::vector<uint8_t>> out;
+  for (size_t i = 1; i < packets.size(); ++i)
+  {
+    out = reassembler.processPacket(packets[i], 1000);
+  }
+  TEST_ASSERT_TRUE(out.has_value());
+  TEST_ASSERT_TRUE(out.value() == data);
+}
+
+/**
+ * @brief A message split with a negotiated payload size of 100 B produces 10 chunks of at most 100 B, all of
+ * which pass the receiver's validation and reassemble to the original message.
+ */
+static void test_split_with_negotiated_payload_size(void)
+{
+  std::vector<uint8_t> data(1000);
+  for (size_t i = 0; i < data.size(); ++i)
+  {
+    data[i] = static_cast<uint8_t>(i * 7);
+  }
+
+  auto packets = PacketSerializer::splitVectorToPackets(data, 5, 0x01, 0x02, 100);
+  TEST_ASSERT_EQUAL_size_t(10, packets.size());
+
+  PacketReassembler reassembler;
+  std::optional<std::vector<uint8_t>> out;
+  for (const auto &p : packets)
+  {
+    TEST_ASSERT_TRUE(p.header.payloadSize <= 100);
+    TEST_ASSERT_FALSE(PacketValidator::validate(p).has_value());
+    out = reassembler.processPacket(p, 1000);
+  }
+  TEST_ASSERT_TRUE(out.has_value());
+  TEST_ASSERT_TRUE(out.value() == data);
+}
+
+/**
+ * @brief The chunk size is the negotiated one only while connected to that peer; otherwise the maximum, and never
+ * outside [1, LORA_MAX_PAYLOAD_SIZE].
+ */
+static void test_connection_payload_size_for_destination(void)
+{
+  ConnectionSession conn;
+  TEST_ASSERT_EQUAL_size_t(LORA_MAX_PAYLOAD_SIZE, conn.payloadSizeFor(0x02));  // CLOSED
+
+  conn.state = ConnectionState::ESTABLISHED;
+  conn.peerAddr = 0x02;
+  conn.negotiatedPayloadSize = 100;
+  TEST_ASSERT_EQUAL_size_t(100, conn.payloadSizeFor(0x02));
+  TEST_ASSERT_EQUAL_size_t(LORA_MAX_PAYLOAD_SIZE, conn.payloadSizeFor(0x03));  // another destination
+
+  conn.negotiatedPayloadSize = 0;
+  TEST_ASSERT_EQUAL_size_t(LORA_MAX_PAYLOAD_SIZE, conn.payloadSizeFor(0x02));
+}
+
+/**
+ * @brief A broadcast frame must not ask for an acknowledgment nor carry connection control: there is no single
+ * receiver to answer, and every node would reply at once.
+ */
+static void test_broadcast_with_reliability_or_connection_flags_is_rejected(void)
+{
+  const uint8_t offending[] = {FLAG_ACK_REQ, FLAG_CONN_REQ, FLAG_CONN_ACK, FLAG_CONN_NACK,
+                               static_cast<uint8_t>(FLAG_CONN_REQ | FLAG_CONN_ACK)};
+  for (uint8_t flags : offending)
+  {
+    PacketHeader h{};
+    h.dstAddr = ADDRESS_BROADCAST;
+    h.flags = flags;
+    TEST_ASSERT_TRUE(PacketValidator::isBroadcastWithReliabilityFlags(h));
+
+    h.dstAddr = 0x02;  // the same flags are fine on a unicast frame
+    TEST_ASSERT_FALSE(PacketValidator::isBroadcastWithReliabilityFlags(h));
+  }
+
+  PacketHeader plain{};
+  plain.dstAddr = ADDRESS_BROADCAST;
+  plain.flags = 0;
+  TEST_ASSERT_FALSE(PacketValidator::isBroadcastWithReliabilityFlags(plain));
+}
+
+/**
+ * @brief Reliable delivery needs a unicast destination.
+ */
+static void test_reliable_send_requires_unicast_destination(void)
+{
+  TEST_ASSERT_FALSE(PacketValidator::canSendReliablyTo(ADDRESS_BROADCAST));
+  TEST_ASSERT_TRUE(PacketValidator::canSendReliablyTo(0x01));
+  TEST_ASSERT_TRUE(PacketValidator::canSendReliablyTo(0xFE));
+}
+
+/**
+ * @brief A peer that keeps sending (a new message ID per message) must keep the connection alive, even when the
+ * total duration exceeds the inactivity timeout.
+ */
+static void test_connection_activity_refreshed_by_peer_frames(void)
+{
+  ConnectionSession conn;
+  conn.state = ConnectionState::ESTABLISHED;
+  conn.peerAddr = 0x02;
+  conn.sessionMsgId = 10;  // the handshake ID; data messages use other IDs
+  conn.timeoutMs = 15000;
+  conn.lastActivityMs = 0;
+
+  // One frame every 10 s for 60 s: 4x the inactivity timeout.
+  for (uint32_t now = 10000; now <= 60000; now += 10000)
+  {
+    TEST_ASSERT_FALSE(conn.inactivityExpired(now));
+    TEST_ASSERT_TRUE(conn.touchOnFrameFrom(0x02, now));
+  }
+  TEST_ASSERT_FALSE(conn.inactivityExpired(60000 + 15000));
+  TEST_ASSERT_TRUE(conn.inactivityExpired(60000 + 15001));
+}
+
+/**
+ * @brief Frames from another node must not keep the connection alive.
+ */
+static void test_connection_activity_not_refreshed_by_other_nodes(void)
+{
+  ConnectionSession conn;
+  conn.state = ConnectionState::ESTABLISHED;
+  conn.peerAddr = 0x02;
+  conn.timeoutMs = 15000;
+  conn.lastActivityMs = 1000;
+
+  TEST_ASSERT_FALSE(conn.touchOnFrameFrom(0x03, 12000));
+  TEST_ASSERT_EQUAL_UINT32(1000, conn.lastActivityMs);
+  TEST_ASSERT_TRUE(conn.inactivityExpired(16001));
+}
+
+/**
+ * @brief Only an ESTABLISHED connection is refreshed by data frames (SYN_RCVD is promoted elsewhere).
+ */
+static void test_connection_activity_ignored_when_not_established(void)
+{
+  ConnectionSession conn;
+  conn.state = ConnectionState::CLOSED;
+  conn.peerAddr = 0x02;
+  conn.lastActivityMs = 500;
+
+  TEST_ASSERT_FALSE(conn.touchOnFrameFrom(0x02, 9000));
+  TEST_ASSERT_EQUAL_UINT32(500, conn.lastActivityMs);
+}
+
+/**
+ * @brief After forgetSender() a message with the same (srcAddr, messageId) as a completed one is delivered again:
+ * a sender that rebooted and reused the ID must not be taken for a duplicate.
+ */
+static void test_reassembler_forget_sender_clears_completed_history(void)
+{
+  PacketReassembler reassembler;
+  uint32_t time = 1000;
+
+  reassembler.markCompleted(0x01, 7, time);
+  reassembler.markCompleted(0x02, 7, time);
+  TEST_ASSERT_TRUE(reassembler.isCompleted(0x01, 7, time));
+
+  reassembler.forgetSender(0x01);
+
+  TEST_ASSERT_FALSE(reassembler.isCompleted(0x01, 7, time));
+  TEST_ASSERT_TRUE(reassembler.isCompleted(0x02, 7, time));  // other senders are untouched
+}
+
+/**
+ * @brief forgetSender() also drops the partial session of that sender, so frames of the new message do not
+ * merge with chunks of the previous incarnation.
+ */
+static void test_reassembler_forget_sender_drops_partial_sessions(void)
+{
+  PacketReassembler reassembler;
+  uint32_t time = 1000;
+
+  reassembler.processPacket(create_chunk(9, 0, 2, "A", 0x01), time);
+  reassembler.processPacket(create_chunk(9, 0, 2, "Y", 0x02), time);
+
+  reassembler.forgetSender(0x01);
+
+  std::vector<uint8_t> bitmap;
+  TEST_ASSERT_FALSE(reassembler.getReceivedBitmap(0x01, 9, bitmap));
+  TEST_ASSERT_TRUE(reassembler.getReceivedBitmap(0x02, 9, bitmap));
+
+  // The new message starts from scratch: chunk 1 alone must not complete it.
+  auto res = reassembler.processPacket(create_chunk(9, 1, 2, "B", 0x01), time);
+  TEST_ASSERT_FALSE(res.has_value());
+}
+
+/**
+ * @brief A completed entry older than COMPLETED_HISTORY_TTL_MS no longer suppresses a message with the same key.
+ */
+static void test_reassembler_completed_entry_expires(void)
+{
+  PacketReassembler reassembler;
+  const uint32_t ttl = LoRaMultiPacketConfig::COMPLETED_HISTORY_TTL_MS;
+  uint32_t time = 5000;
+
+  reassembler.markCompleted(0x01, 11, time);
+
+  TEST_ASSERT_TRUE(reassembler.isCompleted(0x01, 11, time + ttl));       // exactly at the limit: still a duplicate
+  TEST_ASSERT_FALSE(reassembler.isCompleted(0x01, 11, time + ttl + 1));  // expired
+
+  // The expired entry does not block a new message with the same key.
+  auto first = reassembler.processPacket(create_chunk(11, 0, 2, "A", 0x01), time + ttl + 1);
+  TEST_ASSERT_FALSE(first.has_value());
+  auto done = reassembler.processPacket(create_chunk(11, 1, 2, "B", 0x01), time + ttl + 1);
+  TEST_ASSERT_TRUE(done.has_value());
+}
+
+/**
+ * @brief A completed entry inside the window keeps suppressing the duplicate (e.g. a retransmission after a lost SACK),
+ * also across a prune() call.
+ */
+static void test_reassembler_completed_entry_within_ttl_suppresses_duplicate(void)
+{
+  PacketReassembler reassembler;
+  const uint32_t ttl = LoRaMultiPacketConfig::COMPLETED_HISTORY_TTL_MS;
+  uint32_t time = 5000;
+
+  reassembler.markCompleted(0x01, 12, time);
+  reassembler.prune(time + ttl / 2, 1000);
+
+  TEST_ASSERT_TRUE(reassembler.isCompleted(0x01, 12, time + ttl / 2));
+}
+
+/**
+ * @brief Message IDs derived from a random word are never 0 (reserved), and a fresh boot does not start at 1.
+ */
+static void test_message_id_from_random_is_never_zero(void)
+{
+  TEST_ASSERT_EQUAL_UINT16(1, messageIdFromRandom(0x00000000));
+  TEST_ASSERT_EQUAL_UINT16(1, messageIdFromRandom(0xABCD0000));  // low 16 bits are zero
+  TEST_ASSERT_EQUAL_UINT16(0x1234, messageIdFromRandom(0xDEAD1234));
+  TEST_ASSERT_EQUAL_UINT16(0xFFFF, messageIdFromRandom(0xFFFFFFFF));
 }
 
 /**
@@ -878,7 +1199,8 @@ int main(void)
   RUN_TEST(test_validator_invalid_total_chunks);
   RUN_TEST(test_validator_invalid_chunk_index);
   RUN_TEST(test_validator_invalid_payload_size_too_large);
-  RUN_TEST(test_validator_invalid_payload_size_non_final_partial);
+  RUN_TEST(test_validator_invalid_payload_size_non_final_empty);
+  RUN_TEST(test_validator_accepts_non_final_chunk_of_negotiated_size);
   RUN_TEST(test_validator_crc_mismatch);
   RUN_TEST(test_validator_bypass_ack_flags);
 
@@ -894,6 +1216,22 @@ int main(void)
   RUN_TEST(test_reassembler_get_received_bitmap);
   RUN_TEST(test_reassembler_completed_messages);
   RUN_TEST(test_reassembler_same_msgid_different_senders);
+  RUN_TEST(test_reassembler_forget_sender_clears_completed_history);
+  RUN_TEST(test_reassembler_forget_sender_drops_partial_sessions);
+  RUN_TEST(test_reassembler_completed_entry_expires);
+  RUN_TEST(test_reassembler_completed_entry_within_ttl_suppresses_duplicate);
+  RUN_TEST(test_message_id_from_random_is_never_zero);
+  RUN_TEST(test_reassembler_admission_checks_free_heap);
+  RUN_TEST(test_reassembler_admission_full_table_and_open_session);
+  RUN_TEST(test_reassembler_admit_connection_needs_slot_and_margin);
+  RUN_TEST(test_reassembler_rejects_chunks_of_inconsistent_size);
+  RUN_TEST(test_split_with_negotiated_payload_size);
+  RUN_TEST(test_connection_payload_size_for_destination);
+  RUN_TEST(test_broadcast_with_reliability_or_connection_flags_is_rejected);
+  RUN_TEST(test_reliable_send_requires_unicast_destination);
+  RUN_TEST(test_connection_activity_refreshed_by_peer_frames);
+  RUN_TEST(test_connection_activity_not_refreshed_by_other_nodes);
+  RUN_TEST(test_connection_activity_ignored_when_not_established);
   RUN_TEST(test_reassembler_total_chunks_mismatch_dropped);
   RUN_TEST(test_reassembler_total_chunks_mismatch_does_not_refresh);
 

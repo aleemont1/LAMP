@@ -20,15 +20,17 @@ void PacketSerializer::serialize(const Packet &packet, uint8_t *buffer)
 }
 
 std::vector<Packet> PacketSerializer::splitBufferToPackets(const uint8_t *data, size_t length, uint16_t packetNumberStart,
-                                                           uint8_t srcAddr, uint8_t dstAddr)
+                                                           uint8_t srcAddr, uint8_t dstAddr, size_t maxPayloadSize)
 {
   std::vector<Packet> result;
   if (data == nullptr || length == 0)
     return result;
 
+  maxPayloadSize = std::min(std::max<size_t>(maxPayloadSize, 1), LORA_MAX_PAYLOAD_SIZE);
+
   size_t offset = 0;
   uint16_t messageId = packetNumberStart;
-  size_t numChunks = (length + LORA_MAX_PAYLOAD_SIZE - 1) / LORA_MAX_PAYLOAD_SIZE;
+  size_t numChunks = (length + maxPayloadSize - 1) / maxPayloadSize;
   if (numChunks > 255)
   {
     return result;  // Payload exceeds maximum segmentable protocol size
@@ -47,7 +49,7 @@ std::vector<Packet> PacketSerializer::splitBufferToPackets(const uint8_t *data, 
 
     size_t remaining = length - offset;
     uint8_t payloadSize =
-        static_cast<uint8_t>(std::min(remaining, LORA_MAX_PAYLOAD_SIZE));
+        static_cast<uint8_t>(std::min(remaining, maxPayloadSize));
     packet.header.payloadSize = payloadSize;
 
     std::memcpy(packet.payload.data, data + offset, payloadSize);
@@ -74,7 +76,8 @@ std::vector<Packet> PacketSerializer::splitBufferToPackets(const uint8_t *data, 
 }
 
 std::vector<Packet> PacketSerializer::splitVectorToPackets(const std::vector<uint8_t> &data, uint16_t packetNumberStart,
-                                                           uint8_t srcAddr, uint8_t dstAddr)
+                                                           uint8_t srcAddr, uint8_t dstAddr, size_t maxPayloadSize)
 {
-  return splitBufferToPackets(data.empty() ? nullptr : data.data(), data.size(), packetNumberStart, srcAddr, dstAddr);
+  return splitBufferToPackets(data.empty() ? nullptr : data.data(), data.size(), packetNumberStart, srcAddr, dstAddr,
+                              maxPayloadSize);
 }

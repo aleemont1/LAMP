@@ -32,10 +32,13 @@ class PacketSerializer
    * @param packetNumberStart The Message ID to assign to these packets (default: 1).
    * @param srcAddr Source node ID (default: ADDRESS_UNASSIGNED).
    * @param dstAddr Destination node ID (default: ADDRESS_BROADCAST).
+   * @param maxPayloadSize Payload bytes per chunk (the size negotiated in the handshake), clamped to
+   *        [1, LORA_MAX_PAYLOAD_SIZE].
    * @return std::vector<Packet> A list of ready-to-send packets.
    */
   static std::vector<Packet> splitBufferToPackets(const uint8_t *data, size_t length, uint16_t packetNumberStart = 1,
-                                                  uint8_t srcAddr = ADDRESS_UNASSIGNED, uint8_t dstAddr = ADDRESS_BROADCAST);
+                                                  uint8_t srcAddr = ADDRESS_UNASSIGNED, uint8_t dstAddr = ADDRESS_BROADCAST,
+                                                  size_t maxPayloadSize = LORA_MAX_PAYLOAD_SIZE);
 
   /**
    * @brief Convenience overload for std::vector input.
@@ -43,8 +46,10 @@ class PacketSerializer
    * @param packetNumberStart The Message ID to assign to these packets (default: 1).
    * @param srcAddr Source node ID (default: ADDRESS_UNASSIGNED).
    * @param dstAddr Destination node ID (default: ADDRESS_BROADCAST).
+   * @param maxPayloadSize Payload bytes per chunk, clamped to [1, LORA_MAX_PAYLOAD_SIZE].
    * @return std::vector<Packet> A list of ready-to-send packets.
    */
   static std::vector<Packet> splitVectorToPackets(const std::vector<uint8_t> &data, uint16_t packetNumberStart = 1,
-                                                  uint8_t srcAddr = ADDRESS_UNASSIGNED, uint8_t dstAddr = ADDRESS_BROADCAST);
+                                                  uint8_t srcAddr = ADDRESS_UNASSIGNED, uint8_t dstAddr = ADDRESS_BROADCAST,
+                                                  size_t maxPayloadSize = LORA_MAX_PAYLOAD_SIZE);
 };

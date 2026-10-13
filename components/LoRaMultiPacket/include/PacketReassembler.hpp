@@ -77,14 +77,51 @@ class PacketReassembler
   bool getReceivedBitmap(uint8_t srcAddr, uint16_t messageId, std::vector<uint8_t> &bitmapOut) const;
 
   /**
-   * @brief Checks if a message from a given sender was recently completed.
+   * @brief Checks if a message from a given sender was completed within COMPLETED_HISTORY_TTL_MS.
+   *
+   * An older entry is not a duplicate any more: the sender may have rebooted and reused the message ID.
    */
-  bool isCompleted(uint8_t srcAddr, uint16_t messageId) const;
+  bool isCompleted(uint8_t srcAddr, uint16_t messageId, uint32_t currentTimestampMs) const;
 
   /**
-   * @brief Marks a message from a given sender as completed, adding it to the history.
+   * @brief Marks a message from a given sender as completed, adding it to the history with its timestamp.
    */
-  void markCompleted(uint8_t srcAddr, uint16_t messageId);
+  void markCompleted(uint8_t srcAddr, uint16_t messageId, uint32_t currentTimestampMs);
+
+  /// Outcome of an admission check.
+  enum class Admission : uint8_t
+  {
+    OK,
+    TABLE_FULL,  ///< every session slot is in use
+    NO_MEMORY    ///< the free heap cannot hold the session plus the margin
+  };
+
+  /**
+   * @brief Heap needed to reassemble a message of totalChunks chunks: the chunks as stored in the session map plus
+   * the reassembled message built at completion.
+   */
+  static size_t sessionBytes(uint8_t totalChunks);
+
+  /**
+   * @brief Decides whether a frame may open a new session, given the free heap.
+   *
+   * A frame of an already open session is always OK (its memory is accounted for). Otherwise a slot must be free and
+   * the heap must hold sessionBytes(totalChunks) plus RX_HEAP_MARGIN_BYTES.
+   */
+  Admission admit(uint8_t srcAddr, uint16_t messageId, uint8_t totalChunks, size_t freeHeapBytes) const;
+
+  /**
+   * @brief Decides whether a connection request may be accepted. The SYN does not carry the message size, so only a
+   * free session slot and the heap margin are checked; the size is checked by admit() on the first data frame.
+   */
+  Admission admitConnection(size_t freeHeapBytes) const;
+
+  /**
+   * @brief Forgets everything known about a sender: its completed messages and its partial sessions.
+   *
+   * Called when the sender opens a new connection, which means it may have restarted and reuse old message IDs.
+   */
+  void forgetSender(uint8_t srcAddr);
 
  private:
   static constexpr size_t MAX_COMPLETED_HISTORY = LoRaMultiPacketConfig::MAX_COMPLETED_HISTORY;
@@ -113,7 +150,13 @@ class PacketReassembler
   }
 
   std::map<uint32_t, ReassemblySession> sessions_;
-  std::vector<uint32_t> completedMessages_;
+
+  struct CompletedEntry
+  {
+    uint32_t key;
+    uint32_t completedTime;
+  };
+  std::vector<CompletedEntry> completedMessages_;
 
   static std::vector<uint8_t> reconstruct(const ReassemblySession &session);
 };

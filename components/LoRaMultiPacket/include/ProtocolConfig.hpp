@@ -30,6 +30,15 @@ constexpr uint32_t POLL_SLEEP_DELAY_MS = 10;
 constexpr size_t MAX_CONCURRENT_SESSIONS = 10;
 constexpr size_t MAX_COMPLETED_HISTORY = 16;
 
+// Receiver heap admission. A reassembly session holds one std::map node per received chunk (a Packet plus the node
+// bookkeeping) and, once complete, the reassembled message next to them.
+constexpr size_t RX_CHUNK_NODE_OVERHEAD_BYTES = 32;  // std::map node bookkeeping per chunk (32-bit target)
+constexpr size_t RX_HEAP_MARGIN_BYTES = 16384;       // heap that must stay free for the rest of the firmware
+// How long a completed message keeps suppressing duplicates. A duplicate can only come from the sender's retry
+// window after a lost SACK: (MAX_RETRIES + 1) SACK timeouts, about 100 s for a full-size frame at SF12/125 kHz
+// (SACK timeout 16.8 s). Rounded up; raise it for narrower bandwidths or a larger MAX_RETRIES.
+constexpr uint32_t COMPLETED_HISTORY_TTL_MS = 120000;
+
 // Airtime Safety Multipliers
 constexpr double ACK_TIMEOUT_SAFETY_FACTOR = 1.5;
 constexpr uint32_t ACK_TIMEOUT_GUARD_MS = 25;

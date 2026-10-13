@@ -7,8 +7,43 @@
 bool PacketReassembler::isConsistent(const Packet &packet) const
 {
   auto it = sessions_.find(sessionKey(packet.header.srcAddr, packet.header.messageId));
-  return it == sessions_.end() ||
-         (it->second.totalChunks == packet.header.totalChunks && packet.header.chunkIndex < it->second.totalChunks);
+  if (it == sessions_.end())
+  {
+    return true;
+  }
+
+  const ReassemblySession &session = it->second;
+  if (session.totalChunks != packet.header.totalChunks || packet.header.chunkIndex >= session.totalChunks)
+  {
+    return false;
+  }
+
+  // Chunk sizes: all non-final chunks of a message have the size negotiated in the handshake, and the final one is
+  // not larger. The (stateless) validator cannot check this, so the first chunk received sets the stride.
+  const uint8_t lastIdx = session.totalChunks - 1;
+  size_t stride = 0;  // 0 = not known yet
+  for (const auto &entry : session.chunks)
+  {
+    if (entry.first != lastIdx)
+    {
+      stride = entry.second.header.payloadSize;
+      break;
+    }
+  }
+  if (packet.header.chunkIndex != lastIdx)
+  {
+    if (stride == 0)
+    {
+      stride = packet.header.payloadSize;
+    }
+    else if (packet.header.payloadSize != stride)
+    {
+      return false;
+    }
+    auto last = session.chunks.find(lastIdx);
+    return last == session.chunks.end() || last->second.header.payloadSize <= stride;
+  }
+  return stride == 0 || packet.header.payloadSize <= stride;
 }
 
 std::optional<std::vector<uint8_t>> PacketReassembler::processPacket(const Packet &packet, uint32_t currentTimestampMs)
@@ -97,22 +132,78 @@ bool PacketReassembler::getReceivedBitmap(uint8_t srcAddr, uint16_t messageId, s
   return true;
 }
 
-bool PacketReassembler::isCompleted(uint8_t srcAddr, uint16_t messageId) const
+bool PacketReassembler::isCompleted(uint8_t srcAddr, uint16_t messageId, uint32_t currentTimestampMs) const
 {
-  return std::find(completedMessages_.begin(), completedMessages_.end(), sessionKey(srcAddr, messageId)) != completedMessages_.end();
+  uint32_t key = sessionKey(srcAddr, messageId);
+  return std::any_of(completedMessages_.begin(), completedMessages_.end(),
+                     [&](const CompletedEntry &entry)
+                     {
+                       return entry.key == key &&
+		              currentTimestampMs - entry.completedTime <= LoRaMultiPacketConfig::COMPLETED_HISTORY_TTL_MS;
+                     });
 }
 
-void PacketReassembler::markCompleted(uint8_t srcAddr, uint16_t messageId)
+void PacketReassembler::markCompleted(uint8_t srcAddr, uint16_t messageId, uint32_t currentTimestampMs)
 {
-  if (isCompleted(srcAddr, messageId))
-  {
-    return;
-  }
+  uint32_t key = sessionKey(srcAddr, messageId);
+  // Refresh the entry if it is already there (expired or not), so the key appears once.
+  completedMessages_.erase(std::remove_if(completedMessages_.begin(), completedMessages_.end(),
+                                          [&](const CompletedEntry &entry)
+                                          { return entry.key == key; }),
+                           completedMessages_.end());
   if (completedMessages_.size() >= MAX_COMPLETED_HISTORY)
   {
     completedMessages_.erase(completedMessages_.begin());
   }
-  completedMessages_.push_back(sessionKey(srcAddr, messageId));
+  completedMessages_.push_back({key, currentTimestampMs});
+}
+
+size_t PacketReassembler::sessionBytes(uint8_t totalChunks)
+{
+  return static_cast<size_t>(totalChunks) *
+         (sizeof(Packet) + LoRaMultiPacketConfig::RX_CHUNK_NODE_OVERHEAD_BYTES + LORA_MAX_PAYLOAD_SIZE);
+}
+
+PacketReassembler::Admission PacketReassembler::admit(uint8_t srcAddr, uint16_t messageId, uint8_t totalChunks,
+                                                      size_t freeHeapBytes) const
+{
+  if (sessions_.count(sessionKey(srcAddr, messageId)) != 0)
+  {
+    return Admission::OK;
+  }
+  if (sessions_.size() >= MAX_CONCURRENT_MESSAGES)
+  {
+    return Admission::TABLE_FULL;
+  }
+  if (freeHeapBytes < sessionBytes(totalChunks) + LoRaMultiPacketConfig::RX_HEAP_MARGIN_BYTES)
+  {
+    return Admission::NO_MEMORY;
+  }
+  return Admission::OK;
+}
+
+PacketReassembler::Admission PacketReassembler::admitConnection(size_t freeHeapBytes) const
+{
+  if (sessions_.size() >= MAX_CONCURRENT_MESSAGES)
+  {
+    return Admission::TABLE_FULL;
+  }
+  return (freeHeapBytes < LoRaMultiPacketConfig::RX_HEAP_MARGIN_BYTES) ? Admission::NO_MEMORY : Admission::OK;
+}
+
+void PacketReassembler::forgetSender(uint8_t srcAddr)
+{
+  auto fromSender = [srcAddr](uint32_t key)
+  { return static_cast<uint8_t>(key >> 16) == srcAddr; };
+
+  completedMessages_.erase(std::remove_if(completedMessages_.begin(), completedMessages_.end(),
+                                          [&](const CompletedEntry &entry)
+                                          { return fromSender(entry.key); }),
+                           completedMessages_.end());
+  for (auto it = sessions_.begin(); it != sessions_.end();)
+  {
+    it = fromSender(it->first) ? sessions_.erase(it) : std::next(it);
+  }
 }
 
 std::vector<uint8_t> PacketReassembler::reconstruct(const ReassemblySession &session)

@@ -1,11 +1,18 @@
 #include "LoRaProtocol.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <random>
+#include <utility>
+
+#include "PacketValidator.hpp"
 
 #ifdef ESP_PLATFORM
 #include "esp_log.h"
+#include "esp_random.h"
+#include "esp_system.h"
 static const char *TAG = "LoRaProto";
 #else
 #define ESP_LOGI(tag, format, ...) printf("INFO  [%s]: " format "\n", tag, ##__VA_ARGS__)
@@ -14,27 +21,74 @@ static const char *TAG = "LoRaProto";
 static const char *TAG = "LoRaProto";
 #endif
 
-LoRaProtocol::LoRaProtocol(SX1262 *radio, RadioLibHal *hal, uint32_t irqPin)
+static size_t defaultFreeHeap()
+{
+#ifdef ESP_PLATFORM
+  return esp_get_free_heap_size();
+#else
+  return SIZE_MAX;
+#endif
+}
+
+LoRaProtocol::LoRaProtocol(SX1262 *radio, RadioLibHal *hal, uint32_t irqPin, std::function<uint32_t()> randomSource)
     : radio_(radio),
       hal_(hal),
       irqPin_(irqPin),
       nodeAddress_(ADDRESS_UNASSIGNED),
       onConnRequest_(nullptr),
       dropPacketCallback_(nullptr),
+      freeHeapProvider_(defaultFreeHeap),
       verbose_(false),
+      randomSource_(std::move(randomSource)),
       nextMessageId_(1),
+      messageIdSeeded_(false),
       phyBuffer_{0}
 {
   connection_.state = ConnectionState::CLOSED;
 }
 
-bool LoRaProtocol::connect(uint8_t targetAddress, uint32_t timeoutMs)
+uint16_t LoRaProtocol::allocateMessageId()
 {
-  uint16_t msgId = nextMessageId_++;
+  if (!messageIdSeeded_)
+  {
+    uint32_t seed;
+    if (randomSource_)
+    {
+      seed = randomSource_();
+    }
+    else
+    {
+#ifdef ESP_PLATFORM
+      // SX1262 noise source (two bytes; it leaves the radio in standby, the next TX/RX restarts it) mixed with the
+      // ESP32 generator, which is only partly random without WiFi/BT.
+      uint32_t radioWord = radio_->randomByte();
+      radioWord = (radioWord << 8) | radio_->randomByte();
+      seed = (radioWord << 16) ^ radioWord ^ esp_random();
+#else
+      seed = std::random_device{}();
+#endif
+    }
+    nextMessageId_ = messageIdFromRandom(seed);
+    messageIdSeeded_ = true;
+  }
+
+  uint16_t id = nextMessageId_++;
   if (nextMessageId_ == 0)
   {
     nextMessageId_ = 1;
   }
+  return id;
+}
+
+bool LoRaProtocol::connect(uint8_t targetAddress, uint32_t timeoutMs)
+{
+  if (!PacketValidator::canSendReliablyTo(targetAddress))
+  {
+    ESP_LOGE(TAG, "connect() needs a unicast target: a broadcast SYN would be dropped by every receiver");
+    return false;
+  }
+
+  uint16_t msgId = allocateMessageId();
 
   connection_.state = ConnectionState::SYN_SENT;
   connection_.sessionMsgId = msgId;
@@ -196,13 +250,18 @@ bool LoRaProtocol::send(uint8_t targetAddress, const std::vector<uint8_t> &data,
     return false;
   }
 
-  uint16_t msgId = nextMessageId_++;
-  if (nextMessageId_ == 0)
+  if (reliable && !PacketValidator::canSendReliablyTo(targetAddress))
   {
-    nextMessageId_ = 1;
+    ESP_LOGE(TAG, "Reliable send to broadcast rejected: there is no single peer to acknowledge. Use a unicast target.");
+    return false;
   }
 
-  std::vector<Packet> packets = PacketSerializer::splitVectorToPackets(data, msgId, nodeAddress_, targetAddress);
+  uint16_t msgId = allocateMessageId();
+
+  // Negotiated in the handshake when connected to this peer; the maximum otherwise.
+  const size_t chunkPayloadSize = connection_.payloadSizeFor(targetAddress);
+
+  std::vector<Packet> packets = PacketSerializer::splitVectorToPackets(data, msgId, nodeAddress_, targetAddress, chunkPayloadSize);
   if (packets.empty())
   {
     return false;
@@ -212,7 +271,7 @@ bool LoRaProtocol::send(uint8_t targetAddress, const std::vector<uint8_t> &data,
   {
     packets.back().header.flags |= FLAG_ACK_REQ;
     packets.back().calculateCRC();
-    return sendReliable(packets);
+    return sendReliable(packets, chunkPayloadSize);
   }
 
   return sendUnreliable(packets);
@@ -252,12 +311,12 @@ bool LoRaProtocol::sendUnreliable(const std::vector<Packet> &packets)
   return true;
 }
 
-bool LoRaProtocol::sendReliable(const std::vector<Packet> &packets)
+bool LoRaProtocol::sendReliable(const std::vector<Packet> &packets, size_t chunkPayloadSize)
 {
   uint16_t msgId = packets[0].header.messageId;
   uint8_t targetAddr = packets[0].header.dstAddr;
   uint8_t totalChunks = static_cast<uint8_t>(packets.size());
-  uint32_t ackTimeoutMs = calculateAckTimeoutMs(totalChunks);
+  uint32_t ackTimeoutMs = calculateAckTimeoutMs(totalChunks, chunkPayloadSize);
 
   ESP_LOGI(TAG, "Sending MsgID %u (%u chunks) [Reliable Mode, Timeout=%ums]",
            msgId, (unsigned)totalChunks, (unsigned)ackTimeoutMs);
@@ -347,9 +406,9 @@ bool LoRaProtocol::sendReliable(const std::vector<Packet> &packets)
   }
 }
 
-uint32_t LoRaProtocol::calculateAckTimeoutMs(size_t totalChunks) const
+uint32_t LoRaProtocol::calculateAckTimeoutMs(size_t totalChunks, size_t chunkPayloadSize) const
 {
-  size_t maxPacketLen = HEADER_SIZE + LORA_MAX_PAYLOAD_SIZE + CRC_SIZE;
+  size_t maxPacketLen = HEADER_SIZE + chunkPayloadSize + CRC_SIZE;
   uint32_t toaDataMs = radio_->getTimeOnAir(maxPacketLen) / 1000;
   size_t sackLen = HEADER_SIZE + ((totalChunks + 7) / 8) + CRC_SIZE;
   uint32_t toaSackMs = radio_->getTimeOnAir(sackLen) / 1000;
@@ -466,7 +525,7 @@ void LoRaProtocol::update(uint32_t currentTimestampMs)
   // Inactivity / Idle Timeout Check for active connections
   if (connection_.state == ConnectionState::ESTABLISHED || connection_.state == ConnectionState::SYN_RCVD)
   {
-    if (currentTimestampMs - connection_.lastActivityMs > connection_.timeoutMs)
+    if (connection_.inactivityExpired(currentTimestampMs))
     {
       ESP_LOGW(TAG, "Connection session MsgID %u TIMED OUT due to inactivity (%u ms). Closing connection.",
                connection_.sessionMsgId, (unsigned)(currentTimestampMs - connection_.lastActivityMs));
@@ -567,6 +626,15 @@ void LoRaProtocol::handleIncomingPacket(const Packet &packet, uint32_t currentTi
     return;
   }
 
+  // Broadcast frames cannot be acknowledged or open connections: drop them without answering.
+  if (PacketValidator::isBroadcastWithReliabilityFlags(packet.header))
+  {
+    ESP_LOGW(TAG, "Dropping broadcast frame with ACK_REQ/connection flags (0x%02X) from 0x%02X",
+             (unsigned)packet.header.flags, (unsigned)packet.header.srcAddr);
+    radio_->startReceive();
+    return;
+  }
+
   if (dropPacketCallback_ && dropPacketCallback_(packet))
   {
     ESP_LOGW(TAG, "[SIMULATED LOSS] Artificially dropping Packet: MsgID=%u ChunkIndex=%u/%u",
@@ -619,6 +687,16 @@ void LoRaProtocol::handleIncomingPacket(const Packet &packet, uint32_t currentTi
 	return;
       }
 
+      // Failure Mode: no session slot or heap left. Answer BUSY instead of accepting a transfer we cannot hold.
+      auto admission = reassembler_.admitConnection(freeHeapProvider_());
+      if (admission != PacketReassembler::Admission::OK)
+      {
+	ESP_LOGW(TAG, "SYN rejected for MsgID %u from 0x%02X: %s", msgId, (unsigned)senderAddr,
+	         admission == PacketReassembler::Admission::TABLE_FULL ? "session table full" : "not enough free heap");
+	sendConnNack(senderAddr, msgId, ConnNackReason::BUSY);
+	return;
+      }
+
       SynMetadata synReq{};
       if (packet.header.payloadSize >= sizeof(SynMetadata))
       {
@@ -642,6 +720,10 @@ void LoRaProtocol::handleIncomingPacket(const Packet &packet, uint32_t currentTi
 
       if (accept)
       {
+	// A new connection means the sender may have restarted: its old message IDs must not be taken for duplicates
+	// and its partial sessions must not absorb the frames of the new message.
+	reassembler_.forgetSender(senderAddr);
+
 	connection_.state = ConnectionState::SYN_RCVD;
 	connection_.sessionMsgId = msgId;
 	connection_.peerAddr = senderAddr;
@@ -688,9 +770,9 @@ void LoRaProtocol::handleIncomingPacket(const Packet &packet, uint32_t currentTi
     connection_.lastActivityMs = currentTimestampMs;
     stats_.connEstablished++;
   }
-  else if (connection_.state == ConnectionState::ESTABLISHED && connection_.sessionMsgId == msgId && connection_.peerAddr == senderAddr)
+  else
   {
-    connection_.lastActivityMs = currentTimestampMs;
+    connection_.touchOnFrameFrom(senderAddr, currentTimestampMs);
   }
 
   if (packet.header.flags & FLAG_ACK)
@@ -699,7 +781,7 @@ void LoRaProtocol::handleIncomingPacket(const Packet &packet, uint32_t currentTi
   }
   else
   {
-    bool isAlreadyCompleted = reassembler_.isCompleted(senderAddr, msgId);
+    bool isAlreadyCompleted = reassembler_.isCompleted(senderAddr, msgId, currentTimestampMs);
     bool justCompleted = false;
 
     std::optional<std::vector<uint8_t>> payloadOpt;
@@ -715,10 +797,22 @@ void LoRaProtocol::handleIncomingPacket(const Packet &packet, uint32_t currentTi
 
     if (!isAlreadyCompleted)
     {
+      // Opening a session needs a free slot and enough heap for the whole message: refuse it explicitly instead of
+      // dropping the chunk silently (the sender gets no SACK and gives up after its retry budget).
+      auto admission = reassembler_.admit(senderAddr, msgId, packet.header.totalChunks, freeHeapProvider_());
+      if (admission != PacketReassembler::Admission::OK)
+      {
+	ESP_LOGW(TAG, "Refusing MsgID %u from 0x%02X (%u chunks): %s", (unsigned)msgId, (unsigned)senderAddr,
+	         (unsigned)packet.header.totalChunks,
+	         admission == PacketReassembler::Admission::TABLE_FULL ? "session table full" : "not enough free heap");
+	radio_->startReceive();
+	return;
+      }
+
       payloadOpt = reassembler_.processPacket(packet, currentTimestampMs);
       if (payloadOpt.has_value())
       {
-	reassembler_.markCompleted(senderAddr, msgId);
+	reassembler_.markCompleted(senderAddr, msgId, currentTimestampMs);
 	stats_.packetsRx++;
 	justCompleted = true;
       }
@@ -784,6 +878,11 @@ void LoRaProtocol::setYieldCallback(YieldCallback callback)
 void LoRaProtocol::setDropPacketCallback(DropPacketCallback callback)
 {
   dropPacketCallback_ = callback;
+}
+
+void LoRaProtocol::setFreeHeapProvider(FreeHeapProvider provider)
+{
+  freeHeapProvider_ = provider ? std::move(provider) : FreeHeapProvider(defaultFreeHeap);
 }
 
 void LoRaProtocol::setVerbose(bool enable)
