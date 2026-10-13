@@ -10,7 +10,12 @@ Block B (distance tables): URBAN / RURAL / WATER published fits (+ log-normal sh
 Output: data/ns3_campaign_{A,B}.csv, one line per run:
     label,<RESULT fields of lora-multipacket-sim.cc>
 Block C (loss emulation, mirrors the hardware bench) is run separately.
-Run: python3 run_campaign_ns3.py [A|B|C|AB] [--limit N]   (needs a built scratch/lora-multipacket-sim)
+Block D (related-work baselines): Block A's channel, SNR axis, N and seeds, with MPLR (Chen et al. 2019) and the
+    LoRaMesher large-transfer service (Sole et al. 2026; "LoRaMesher" = MIN_TIMEOUT 20 s, "Tight" = timeout
+    derived like the S&W baseline). Written to ns3_campaign_D.csv so Block A is not re-run.
+Block E: the same baselines on Block B's channels (URBAN/RURAL/WATER and the stress channels), same seeds, so the
+    shadowing draws are paired with LAMP and S&W. Written to ns3_campaign_E.csv.
+Run: python3 run_campaign_ns3.py [A|B|C|D|E|AB] [--limit N]   (needs a built scratch/lora-multipacket-sim)
 """
 import itertools
 import math
@@ -36,6 +41,7 @@ MAX_DIST_M = 100_000.0
 MODES_A = ["Mode1", "Mode2", "Mode3", "Mode4", "SWBase", "SWOpt", "SWBaseConn", "SWOptConn"]
 MODES_B = ["Mode1", "Mode3", "Mode4", "SWBase"]
 MODES_STRESS = ["Mode4", "SWBase"]
+MODES_D = ["MPLR", "LoRaMesher", "LoRaMesherTight"]
 
 # label -> (--env, n, PL(1 km) dB, extra sim args); n/PL mirror the simulator defaults and are used only
 # to map a target SNR to a distance.
@@ -58,6 +64,20 @@ def jobs_A():
     for snr, sf, mode, seed in itertools.product(SNRS, SFS, MODES_A, SEEDS):
         d = distance_for_snr(snr, *FREE_SPACE)
         yield ("A", d, mode, sf, "LOS", seed, ["--sigma=0", "--m=50"])
+
+
+def jobs_D():
+    for snr, sf, mode, seed in itertools.product(SNRS, SFS, MODES_D, SEEDS):
+        d = distance_for_snr(snr, *FREE_SPACE)
+        yield ("D", d, mode, sf, "LOS", seed, ["--sigma=0", "--m=50"])
+
+
+def jobs_E():
+    for label, (env, n, pl1km, extra) in CHANNELS_B.items():
+        for snr, sf, mode, seed in itertools.product(SNRS, SFS, MODES_D, SEEDS):
+            d = distance_for_snr(snr, n, pl1km)
+            if d <= MAX_DIST_M:
+                yield (label, d, mode, sf, env, seed, extra)
 
 
 def jobs_B():
@@ -115,3 +135,7 @@ if __name__ == "__main__":
         campaign("B", jobs_B(), limit)
     if "C" in which:
         campaign("C", jobs_C(), limit)
+    if "D" in which:
+        campaign("D", jobs_D(), limit)
+    if "E" in which:
+        campaign("E", jobs_E(), limit)

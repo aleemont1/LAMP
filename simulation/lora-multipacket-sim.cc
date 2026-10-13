@@ -23,6 +23,7 @@ static const uint8_t FLAG_ACK = 0x08;
 static const uint8_t FLAG_CONN_REQ = 0x10;
 static const uint8_t FLAG_CONN_ACK = 0x20;
 static const uint8_t FLAG_CONN_NACK = 0x40;
+static const uint8_t FLAG_FIN = 0x80;  // MPLR connection teardown (not a LAMP flag)
 
 static const uint8_t ADDR_UNASSIGNED = 0x00;
 static const uint8_t ADDR_BROADCAST = 0xFF;
@@ -45,26 +46,59 @@ enum LampState {
     STATE_CLOSED,
     STATE_SYN_SENT,
     STATE_DATA_TX,
-    STATE_WAIT_SACK, // waiting for SACK bitmap (Mode 3/4) or per-frame ACK (stop-and-wait)
+    STATE_WAIT_SACK, // waiting for SACK bitmap (Mode 3/4), BVACK (MPLR) or per-frame ACK (stop-and-wait)
+    STATE_TEARDOWN,  // MPLR: FIN/ACK/FIN/ACK after the last BVACK
     STATE_DONE
 };
 
-enum class Proto { BEST_EFFORT, SACK, STOP_AND_WAIT };
+enum class Proto { BEST_EFFORT, SACK, STOP_AND_WAIT, BATCH_BVACK };
 
 struct ModeSpec {
-    bool stateful = false;     // 3-way handshake before data
+    bool stateful = false;     // handshake before data
     Proto proto = Proto::SACK;
     bool swOptimized = false;  // stop-and-wait with a tight ACK timeout
+
+    // Frame layout and timers. The defaults are LAMPv2; the baselines override them.
+    uint32_t headerBytes = 9;
+    uint32_t crcBytes = CRC_BYTES;           // application CRC on top of the PHY CRC
+    uint32_t chunkPayload = CHUNK_PAYLOAD;   // application bytes per data frame
+    uint32_t synPayload = 4;                 // SYN / SYN-ACK payload bytes
+    bool threeWay = true;                    // third message (ACK) of the handshake
+    bool teardown = false;                   // FIN/ACK/FIN/ACK after the last acknowledgment
+    uint32_t batchSize = 0;                  // BATCH_BVACK: packets per batch
+    uint32_t maxRetries = MAX_RETRIES;       // repair-round budget (or per-chunk retries, stop-and-wait)
+    double fixedTimeoutMs = 0.0;             // > 0: stop-and-wait timeout fixed by the library
 };
 
 // Mode1..4 are the LAMP modes; SWBase/SWOpt[Conn] are stop-and-wait baselines
 // (one ACK per frame, same R_max per chunk); "Conn" adds the 3WHS.
+// MPLR, LoRaMesher and LoRaMesherTight model the two related protocols on the same channel and PHY
+// (Chen et al., iThings 2019; Sole et al., Comput. Commun. 248, 2026).
 static bool ParseMode(const std::string &m, ModeSpec &s)
 {
     if (m == "Mode1" || m == "UnreliableDatagram" || m == "Unreliable") { s = {false, Proto::BEST_EFFORT, false}; return true; }
     if (m == "Mode2" || m == "UnreliableStream")                       { s = {true,  Proto::BEST_EFFORT, false}; return true; }
     if (m == "Mode3" || m == "ReliableDatagram" || m == "Reliable")    { s = {false, Proto::SACK, false};        return true; }
     if (m == "Mode4" || m == "ReliableStream")                         { s = {true,  Proto::SACK, false};        return true; }
+    if (m == "MPLR") {
+        // 16 B header (EUIs 4+4, service 1, sequence 2, flag 1, payload size 1, batch size 1, checksum 2): no extra CRC,
+        // 239 B of data, batches of up to 40 packets with one bit-vector ACK each, SYN/SYN-ACK, FIN/ACK/FIN/ACK.
+        s = {};
+        s.stateful = true; s.proto = Proto::BATCH_BVACK;
+        s.headerBytes = 16; s.crcBytes = 0; s.chunkPayload = 255 - 16; s.synPayload = 0;
+        s.threeWay = false; s.teardown = true; s.batchSize = 40;
+        return true;
+    }
+    if (m == "LoRaMesher" || m == "LoRaMesherTight") {
+        // Large and reliable transfer service: stop-and-wait with one ACK per chunk, 11 B header, 222 B packets,
+        // SYNC/ACK handshake, MAX_TIMEOUTS = 10; MIN_TIMEOUT = 20 s unless the "Tight" variant is requested.
+        s = {};
+        s.stateful = true; s.proto = Proto::STOP_AND_WAIT;
+        s.headerBytes = 11; s.crcBytes = 0; s.chunkPayload = 222 - 11; s.synPayload = 0;
+        s.threeWay = false; s.maxRetries = 10;
+        s.fixedTimeoutMs = (m == "LoRaMesher") ? 20000.0 : 0.0;
+        return true;
+    }
     if (m.rfind("SW", 0) == 0) {
         s.proto = Proto::STOP_AND_WAIT;
         s.swOptimized = m.find("Opt") != std::string::npos;
@@ -74,7 +108,7 @@ static bool ParseMode(const std::string &m, ModeSpec &s)
     return false;
 }
 
-/** 9-byte LAMPv2 logical header (CRC-16 is accounted for as 2 payload bytes). */
+/** LAMPv2 logical header, 9 bytes (CRC-16 is accounted for as 2 payload bytes); padded to 11 or 16 B for the baselines. */
 class LampHeader : public Header
 {
 public:
@@ -84,19 +118,25 @@ public:
         return tid;
     }
     TypeId GetInstanceTypeId (void) const override { return GetTypeId (); }
-    uint32_t GetSerializedSize (void) const override { return 9; }
+    uint32_t GetSerializedSize (void) const override { return size; }
     void Print (std::ostream &os) const override { os << "flags=" << (int)flags << " chunk=" << (int)chunkIdx << "/" << (int)total; }
     void Serialize (Buffer::Iterator i) const override
     {
         i.WriteU8 (LAMP_VERSION); i.WriteU8 (flags); i.WriteU8 (src); i.WriteU8 (dst);
         i.WriteU16 (msgId); i.WriteU8 (chunkIdx); i.WriteU8 (total); i.WriteU8 (payloadLen);
+        // Padding up to the protocol's header size. The first two padding bytes carry simulator bookkeeping
+        // (batch number and position of the frame in its batch) that real MPLR derives from its sequence numbers.
+        for (uint32_t k = 9; k < size; ++k) i.WriteU8 (k == 9 ? batchId : (k == 10 ? batchPos : 0));
     }
     uint32_t Deserialize (Buffer::Iterator i) override
     {
         i.ReadU8 (); flags = i.ReadU8 (); src = i.ReadU8 (); dst = i.ReadU8 ();
         msgId = i.ReadU16 (); chunkIdx = i.ReadU8 (); total = i.ReadU8 (); payloadLen = i.ReadU8 ();
-        return 9;
+        for (uint32_t k = 9; k < size; ++k) { uint8_t b = i.ReadU8 (); if (k == 9) batchId = b; else if (k == 10) batchPos = b; }
+        return size;
     }
+    uint32_t size = 9;  // serialized size: set to the protocol's header length before RemoveHeader
+    uint8_t batchId = 0, batchPos = 0;
     uint8_t flags = 0, src = 0, dst = 0, chunkIdx = 0, total = 0, payloadLen = 0;
     uint16_t msgId = 1;
 };
@@ -117,7 +157,7 @@ public:
     MultiPacketNode () {}
     virtual ~MultiPacketNode () {}
 
-    void Setup(Ptr<LoraPhy> phy, uint8_t address, uint8_t peerAddress, bool isSender, const ModeSpec &spec, uint32_t totalChunks)
+    void Setup(Ptr<LoraPhy> phy, uint8_t address, uint8_t peerAddress, bool isSender, const ModeSpec &spec, uint32_t totalChunks, uint32_t appBytes)
     {
         m_phy = phy;
         m_nodeAddress = address;
@@ -125,6 +165,7 @@ public:
         m_isSender = isSender;
         m_spec = spec;
         m_totalChunks = totalChunks;
+        m_appBytes = appBytes;
         m_rxChunk.assign(totalChunks, false);
         m_phy->SetReceiveOkCallback(MakeCallback(&MultiPacketNode::ReceiveOk, this));
     }
@@ -143,37 +184,57 @@ public:
 
     Time ToA(uint32_t payloadSize) const
     {
-        return LoraPhy::GetTimeOnAir(9 + payloadSize + CRC_BYTES, m_txParams);
+        return LoraPhy::GetTimeOnAir(m_spec.headerBytes + payloadSize + m_spec.crcBytes, m_txParams);
     }
 
     // Mirrors LoRaProtocol::calculateAckTimeoutMs(): armed after the burst has been transmitted.
-    Time SackTimeout() const
+    Time SackTimeout() const { return SackTimeout(m_totalChunks); }
+
+    // bits = chunks covered by one acknowledgment (the whole message for LAMP, one batch for MPLR).
+    Time SackTimeout(uint32_t bits) const
     {
-        double ms = ACK_TIMEOUT_SAFETY_FACTOR * (ToA(CHUNK_PAYLOAD).GetSeconds() * 1000.0
-                                                + ToA((m_totalChunks + 7) / 8).GetSeconds() * 1000.0)
+        double ms = ACK_TIMEOUT_SAFETY_FACTOR * (ToA(m_spec.chunkPayload).GetSeconds() * 1000.0
+                                                + ToA((bits + 7) / 8).GetSeconds() * 1000.0)
                     + GUARD_MS + GUARD_MS;
         return Seconds(std::max(MIN_ACK_TIMEOUT_MS, ms) / 1000.0);
+    }
+
+    // Control frames without payload (MPLR FIN/ACK): same rule as the SACK timeout with an empty frame each way.
+    Time CtlTimeout() const
+    {
+        double ms = ACK_TIMEOUT_SAFETY_FACTOR * 2.0 * ToA(0).GetSeconds() * 1000.0 + GUARD_MS + GUARD_MS;
+        return Seconds(std::max(MIN_ACK_TIMEOUT_MS, ms) / 1000.0);
+    }
+
+    // Application bytes carried by chunk idx (the last chunk holds the remainder).
+    uint32_t ChunkLen(uint32_t idx) const
+    {
+        if (idx + 1 < m_totalChunks) return m_spec.chunkPayload;
+        return m_appBytes - (m_totalChunks - 1) * m_spec.chunkPayload;
     }
 
     // Stop-and-wait: same rule applied to a single frame (base), or ACK airtime plus margin (optimized).
     Time SwTimeout() const
     {
+        if (m_spec.fixedTimeoutMs > 0.0) return MilliSeconds(m_spec.fixedTimeoutMs);
         double ackMs = ToA(0).GetSeconds() * 1000.0;
         if (m_spec.swOptimized)
             return Seconds((ackMs + 2 * GUARD_MS) / 1000.0);
-        double ms = ACK_TIMEOUT_SAFETY_FACTOR * (ToA(CHUNK_PAYLOAD).GetSeconds() * 1000.0 + ackMs) + GUARD_MS + GUARD_MS;
+        double ms = ACK_TIMEOUT_SAFETY_FACTOR * (ToA(m_spec.chunkPayload).GetSeconds() * 1000.0 + ackMs) + GUARD_MS + GUARD_MS;
         return Seconds(std::max(MIN_ACK_TIMEOUT_MS, ms) / 1000.0);
     }
 
     // Builds header + payload (+2 B CRC placeholder), transmits, returns time on air.
-    Time SendFrame(uint8_t flags, uint8_t chunkIdx, uint8_t total, const std::vector<uint8_t> &payload, uint32_t payloadLen)
+    Time SendFrame(uint8_t flags, uint8_t chunkIdx, uint8_t total, const std::vector<uint8_t> &payload, uint32_t payloadLen,
+                   uint8_t batchId = 0, uint8_t batchPos = 0)
     {
-        std::vector<uint8_t> body(payloadLen + CRC_BYTES, 0);
+        std::vector<uint8_t> body(payloadLen + m_spec.crcBytes, 0);
         std::copy(payload.begin(), payload.begin() + std::min<size_t>(payload.size(), payloadLen), body.begin());
         Ptr<Packet> pkt = Create<Packet>(body.data(), body.size());
         LampHeader h;
         h.flags = flags; h.src = m_nodeAddress; h.dst = m_peerAddress;
         h.msgId = 1; h.chunkIdx = chunkIdx; h.total = total; h.payloadLen = payloadLen;
+        h.size = m_spec.headerBytes; h.batchId = batchId; h.batchPos = batchPos;
         pkt->AddHeader(h);
 
         m_phy->Send(pkt, m_frequencyHz, IQPolarity::UP, m_txParams, m_txPower);
@@ -210,14 +271,14 @@ public:
 
     void SendSyn()
     {
-        Time onAir = SendFrame(FLAG_CONN_REQ, 0, 1, {CHUNK_PAYLOAD, 255, 0, 0}, 4);
+        Time onAir = SendFrame(FLAG_CONN_REQ, 0, 1, {(uint8_t)CHUNK_PAYLOAD, 255, 0, 0}, m_spec.synPayload);
         m_timeoutEvent = Simulator::Schedule(onAir + MilliSeconds(SYN_TIMEOUT_MS), &MultiPacketNode::HandleSynTimeout, this);
     }
 
     void HandleSynTimeout()
     {
         if (!m_running || m_state != STATE_SYN_SENT) return;
-        if (m_synRetries >= MAX_RETRIES) { Finish(false); return; }
+        if (m_synRetries >= m_spec.maxRetries) { Finish(false); return; }
         m_synRetries++;
         SendSyn();
     }
@@ -228,7 +289,8 @@ public:
         m_pending.clear();
         for (uint32_t i = 0; i < m_totalChunks; ++i) m_pending.push_back(i);
         m_idx = 0;
-        if (m_spec.proto == Proto::STOP_AND_WAIT) { m_swCur = 0; SendSwChunk(); }
+        if (m_spec.proto == Proto::BATCH_BVACK) { m_nextNew = 0; m_retx.clear(); StartBatch(); }
+        else if (m_spec.proto == Proto::STOP_AND_WAIT) { m_swCur = 0; SendSwChunk(); }
         else SendNextBurstChunk();
     }
 
@@ -255,7 +317,7 @@ public:
 
         bool last = (m_idx == m_pending.size() - 1);
         uint8_t flags = (m_spec.proto == Proto::SACK && last) ? FLAG_ACK_REQ : FLAG_NONE;
-        Time onAir = SendFrame(flags, m_pending[m_idx], m_totalChunks, {}, CHUNK_PAYLOAD);
+        Time onAir = SendFrame(flags, m_pending[m_idx], m_totalChunks, {}, ChunkLen(m_pending[m_idx]));
         m_chunksTx++;
         m_idx++;
         Simulator::Schedule(onAir + MilliSeconds(POST_TX_GUARD_MS), &MultiPacketNode::SendNextBurstChunk, this);
@@ -267,7 +329,7 @@ public:
         if (!m_running || m_state != STATE_WAIT_SACK) return;
         if (m_rounds >= MAX_RETRIES) { Finish(false); return; }
         m_rounds++;
-        Time onAir = SendFrame(FLAG_ACK_REQ, m_totalChunks - 1, m_totalChunks, {}, CHUNK_PAYLOAD);
+        Time onAir = SendFrame(FLAG_ACK_REQ, m_totalChunks - 1, m_totalChunks, {}, ChunkLen(m_totalChunks - 1));
         m_chunksTx++;
         m_timeoutEvent = Simulator::Schedule(onAir + MilliSeconds(POST_TX_GUARD_MS) + SackTimeout(), &MultiPacketNode::HandleSackTimeout, this);
     }
@@ -292,12 +354,100 @@ public:
         SendNextBurstChunk();
     }
 
+    // ---- MPLR (batched transmission, one bit-vector ACK per batch) --------------------------------
+
+    // A batch holds the chunks reported missing by the previous BVACK followed by new ones, up to batchSize.
+    void StartBatch()
+    {
+        m_batch = m_retx;
+        m_retx.clear();
+        while (m_batch.size() < m_spec.batchSize && m_nextNew < m_totalChunks) m_batch.push_back(m_nextNew++);
+        m_batchId++;
+        m_idx = 0;
+        m_state = STATE_DATA_TX;
+        SendBatchChunk();
+    }
+
+    void SendBatchChunk()
+    {
+        if (!m_running || m_state != STATE_DATA_TX) return;
+        if (m_idx >= m_batch.size())
+        {
+            m_state = STATE_WAIT_SACK;
+            m_timeoutEvent = Simulator::Schedule(SackTimeout(m_batch.size()), &MultiPacketNode::HandleBatchTimeout, this);
+            return;
+        }
+        bool last = (m_idx == m_batch.size() - 1);
+        Time onAir = SendFrame(last ? FLAG_ACK_REQ : FLAG_NONE, m_batch[m_idx], m_batch.size(), {}, ChunkLen(m_batch[m_idx]),
+                               m_batchId, m_idx);
+        m_chunksTx++;
+        m_idx++;
+        Simulator::Schedule(onAir + MilliSeconds(POST_TX_GUARD_MS), &MultiPacketNode::SendBatchChunk, this);
+    }
+
+    // No BVACK: re-send the last frame of the batch with the acknowledgment request (same rule as LAMP).
+    void HandleBatchTimeout()
+    {
+        if (!m_running || m_state != STATE_WAIT_SACK) return;
+        if (m_rounds >= m_spec.maxRetries) { Finish(false); return; }
+        m_rounds++;
+        size_t pos = m_batch.size() - 1;
+        Time onAir = SendFrame(FLAG_ACK_REQ, m_batch[pos], m_batch.size(), {}, ChunkLen(m_batch[pos]), m_batchId, pos);
+        m_chunksTx++;
+        m_timeoutEvent = Simulator::Schedule(onAir + MilliSeconds(POST_TX_GUARD_MS) + SackTimeout(m_batch.size()),
+                                             &MultiPacketNode::HandleBatchTimeout, this);
+    }
+
+    // BVACK: bit i set = i-th frame of the batch received. Gaps go into the next batch; the repair budget is the
+    // same R_max as for LAMP, shared by timeouts and gap rounds.
+    void OnBvack(const std::vector<uint8_t> &bitmap)
+    {
+        Simulator::Cancel(m_timeoutEvent);
+        m_retx.clear();
+        for (size_t pos = 0; pos < m_batch.size(); ++pos)
+        {
+            bool got = (pos / 8 < bitmap.size()) && (bitmap[pos / 8] & (1 << (pos % 8)));
+            if (!got) m_retx.push_back(m_batch[pos]);
+        }
+        if (m_retx.empty() && m_nextNew >= m_totalChunks) { StartTeardown(); return; }
+        if (!m_retx.empty())
+        {
+            if (m_rounds >= m_spec.maxRetries) { Finish(false); return; }
+            m_rounds++;
+        }
+        StartBatch();
+    }
+
+    // Data confirmed: FIN / ACK / FIN / ACK. Failing to close does not undo the delivery.
+    void StartTeardown()
+    {
+        m_senderOk = true;
+        if (!m_spec.teardown) { Finish(true); return; }
+        m_state = STATE_TEARDOWN;
+        m_finRetries = 0;
+        SendFin();
+    }
+
+    void SendFin()
+    {
+        Time onAir = SendFrame(FLAG_FIN, 0, 1, {}, 0);
+        m_timeoutEvent = Simulator::Schedule(onAir + MilliSeconds(POST_TX_GUARD_MS) + CtlTimeout(), &MultiPacketNode::HandleFinTimeout, this);
+    }
+
+    void HandleFinTimeout()
+    {
+        if (!m_running || m_state != STATE_TEARDOWN) return;
+        if (m_finRetries >= m_spec.maxRetries) { Finish(true); return; }
+        m_finRetries++;
+        SendFin();
+    }
+
     // Stop-and-wait baseline: one frame, one ACK, R_max retries per chunk.
     void SendSwChunk()
     {
         if (!m_running || m_state == STATE_DONE) return;
         m_state = STATE_WAIT_SACK;
-        Time onAir = SendFrame(FLAG_ACK_REQ, m_swCur, m_totalChunks, {}, CHUNK_PAYLOAD);
+        Time onAir = SendFrame(FLAG_ACK_REQ, m_swCur, m_totalChunks, {}, ChunkLen(m_swCur));
         m_chunksTx++;
         m_timeoutEvent = Simulator::Schedule(onAir + MilliSeconds(POST_TX_GUARD_MS) + SwTimeout(), &MultiPacketNode::HandleSwTimeout, this);
     }
@@ -305,7 +455,7 @@ public:
     void HandleSwTimeout()
     {
         if (!m_running || m_state != STATE_WAIT_SACK) return;
-        if (m_swRetries >= MAX_RETRIES) { Finish(false); return; }
+        if (m_swRetries >= m_spec.maxRetries) { Finish(false); return; }
         m_swRetries++;
         m_rounds++;
         SendSwChunk();
@@ -331,6 +481,7 @@ public:
 
         Ptr<Packet> p = packet->Copy();
         LampHeader h;
+        h.size = m_spec.headerBytes;
         if (p->GetSize() < h.GetSerializedSize()) return;
         p->RemoveHeader(h);
         if (h.dst != m_nodeAddress) return;
@@ -345,15 +496,31 @@ public:
             if (m_state == STATE_SYN_SENT && (h.flags & FLAG_CONN_REQ) && (h.flags & FLAG_CONN_ACK))
             {
                 Simulator::Cancel(m_timeoutEvent);
-                SendFrame(FLAG_CONN_ACK, 0, 1, {}, 0);
+                if (m_spec.threeWay) SendFrame(FLAG_CONN_ACK, 0, 1, {}, 0);
                 Simulator::Schedule(MilliSeconds(GUARD_MS), &MultiPacketNode::StartData, this);
             }
             else if ((h.flags & FLAG_ACK) && m_state == STATE_WAIT_SACK)
             {
                 if (m_spec.proto == Proto::SACK)
                     OnSack(std::vector<uint8_t>(body.begin(), body.begin() + std::min<size_t>(h.payloadLen, body.size())));
+                else if (m_spec.proto == Proto::BATCH_BVACK)
+                    OnBvack(std::vector<uint8_t>(body.begin(), body.begin() + std::min<size_t>(h.payloadLen, body.size())));
                 else if (m_spec.proto == Proto::STOP_AND_WAIT)
                     OnSwAck(h.chunkIdx);
+            }
+            else if (m_state == STATE_TEARDOWN)
+            {
+                if (h.flags & FLAG_FIN)   // the receiver's FIN: acknowledge and close
+                {
+                    SendFrame(FLAG_ACK, 0, 1, {}, 0);
+                    Simulator::Cancel(m_timeoutEvent);
+                    Finish(true);
+                }
+                else if (h.flags & FLAG_ACK)   // ACK of our FIN: wait for the receiver's FIN
+                {
+                    Simulator::Cancel(m_timeoutEvent);
+                    m_timeoutEvent = Simulator::Schedule(CtlTimeout() + CtlTimeout(), &MultiPacketNode::HandleFinTimeout, this);
+                }
             }
             return;
         }
@@ -361,7 +528,14 @@ public:
         // Receiver
         if ((h.flags & FLAG_CONN_REQ) && !(h.flags & FLAG_CONN_ACK))
         {
-            SendLater(MilliSeconds(GUARD_MS), FLAG_CONN_REQ | FLAG_CONN_ACK, 0, 1, {CHUNK_PAYLOAD, 255, 0, 0}, 4);
+            SendLater(MilliSeconds(GUARD_MS), FLAG_CONN_REQ | FLAG_CONN_ACK, 0, 1, {(uint8_t)CHUNK_PAYLOAD, 255, 0, 0}, m_spec.synPayload);
+            return;
+        }
+        if (h.flags & FLAG_FIN)
+        {
+            // Teardown: ACK, then our own FIN (repeated every time the sender's FIN is repeated).
+            SendLater(MilliSeconds(GUARD_MS), FLAG_ACK, 0, 1, {}, 0);
+            SendLater(MilliSeconds(GUARD_MS) + ToA(0) + MilliSeconds(GUARD_MS), FLAG_FIN, 0, 1, {}, 0);
             return;
         }
         if (h.flags & (FLAG_CONN_ACK | FLAG_ACK | FLAG_CONN_NACK)) return; // handshake completion: nothing to do
@@ -372,6 +546,16 @@ public:
             m_rxChunk[h.chunkIdx] = true;
             m_uniqueChunks++;
             m_lastNewTime = Simulator::Now();
+        }
+
+        if (m_spec.proto == Proto::BATCH_BVACK)
+        {
+            if (h.batchId != m_rxBatchId || m_batchRx.empty())
+            {
+                m_rxBatchId = h.batchId;
+                m_batchRx.assign(h.total, false);
+            }
+            if (h.batchPos < m_batchRx.size()) m_batchRx[h.batchPos] = true;
         }
 
         if (h.flags & FLAG_ACK_REQ)
@@ -386,6 +570,13 @@ public:
             else if (m_spec.proto == Proto::STOP_AND_WAIT)
             {
                 SendLater(MilliSeconds(GUARD_MS), FLAG_ACK, h.chunkIdx, m_totalChunks, {}, 0);
+            }
+            else if (m_spec.proto == Proto::BATCH_BVACK)
+            {
+                std::vector<uint8_t> bvack((m_batchRx.size() + 7) / 8, 0);
+                for (size_t pos = 0; pos < m_batchRx.size(); ++pos)
+                    if (m_batchRx[pos]) bvack[pos / 8] |= (1 << (pos % 8));
+                SendLater(MilliSeconds(GUARD_MS), FLAG_ACK, 0, 1, bvack, bvack.size());
             }
         }
     }
@@ -406,6 +597,15 @@ public:
     LampState m_state = STATE_CLOSED;
 
     uint32_t m_totalChunks = 20;
+    uint32_t m_appBytes = 20 * CHUNK_PAYLOAD;  // application message size
+    // MPLR sender
+    std::vector<uint32_t> m_batch, m_retx;
+    uint32_t m_nextNew = 0;
+    uint8_t m_batchId = 0;
+    uint32_t m_finRetries = 0;
+    // MPLR receiver
+    uint8_t m_rxBatchId = 0;
+    std::vector<bool> m_batchRx;
     std::vector<uint8_t> m_pending;
     size_t m_idx = 0;
     uint32_t m_swCur = 0;
@@ -449,7 +649,7 @@ int main(int argc, char *argv[])
 
     CommandLine cmd;
     cmd.AddValue ("distance", "Distance between nodes in meters", distance);
-    cmd.AddValue ("mode", "Mode1..Mode4, or stop-and-wait baselines SWBase, SWOpt, SWBaseConn, SWOptConn", mode);
+    cmd.AddValue ("mode", "Mode1..Mode4, stop-and-wait baselines SWBase, SWOpt, SWBaseConn, SWOptConn, or related protocols MPLR, LoRaMesher, LoRaMesherTight", mode);
     cmd.AddValue ("sf", "Spreading Factor (7 to 12)", sf);
     cmd.AddValue ("env", "Environment (LOS, URBAN, RURAL)", env);
     cmd.AddValue ("seed", "Random seed for Monte Carlo", seed);
@@ -542,11 +742,15 @@ int main(int argc, char *argv[])
     if (gwPhy1) gwPhy1->AddFrequency(869525000);
 
     Ptr<MultiPacketNode> app0 = CreateObject<MultiPacketNode>();
-    app0->Setup(dev0->GetPhy(), 0x01, 0x02, true, spec, totalChunks);
+    // The application message is the same for every protocol (chunks x 244 B); the baselines split it with their
+    // own payload size, so they need more frames for the same bytes.
+    const uint32_t appBytes = totalChunks * CHUNK_PAYLOAD;
+    totalChunks = (appBytes + spec.chunkPayload - 1) / spec.chunkPayload;
+    app0->Setup(dev0->GetPhy(), 0x01, 0x02, true, spec, totalChunks, appBytes);
     app0->SetTxParams(sf, txPowerDbm, bandwidthHz);
 
     Ptr<MultiPacketNode> app1 = CreateObject<MultiPacketNode>();
-    app1->Setup(dev1->GetPhy(), 0x02, 0x01, false, spec, totalChunks);
+    app1->Setup(dev1->GetPhy(), 0x02, 0x01, false, spec, totalChunks, appBytes);
     app1->SetTxParams(sf, txPowerDbm, bandwidthHz);
     app1->m_lossProb = lossProb;
 
@@ -554,7 +758,7 @@ int main(int argc, char *argv[])
     nodes.Get(1)->AddApplication(app1);
 
     // Worst case (SF10, 5 repair rounds) needs several hundred seconds; the run ends when events run out.
-    const double SIM_END_S = 3600.0;
+    const double SIM_END_S = 7200.0;
     app0->SetStartTime(Seconds(1.0));
     app0->SetStopTime(Seconds(SIM_END_S));
     app1->SetStartTime(Seconds(0.0));

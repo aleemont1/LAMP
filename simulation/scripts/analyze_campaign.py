@@ -23,6 +23,7 @@ PLOTS = os.path.join(HERE, "..", "plots", "campaign")
 os.makedirs(PLOTS, exist_ok=True)
 
 PAYLOAD_BITS = 244 * 8
+MESSAGE_BITS = 20 * PAYLOAD_BITS  # N = 20 chunks of 244 B in every campaign
 DUTY = 0.10
 SFS = [7, 9, 10]
 STYLE = {  # mode -> (label, color, linestyle)
@@ -32,15 +33,29 @@ STYLE = {  # mode -> (label, color, linestyle)
     "Mode4": ("Mode 4 SACK stream", "#d62728", "-"),
     "SWBase": ("Stop-and-wait (base timeout)", "#2ca02c", ":"),
     "SWOpt": ("Stop-and-wait (tight timeout)", "#ff7f0e", ":"),
+    "MPLR": ("MPLR (batch 40, BVACK)", "#9467bd", "-."),
+    "LoRaMesher": ("LoRaMesher transfer (MIN_TIMEOUT 20 s)", "#8c564b", "-."),
+    "LoRaMesherTight": ("LoRaMesher transfer (tight timeout)", "#e377c2", "-."),
 }
+RELATED = ("Mode3", "Mode4", "SWBase", "MPLR", "LoRaMesher", "LoRaMesherTight")
 
 
 def load(name):
+    """Block name -> dataframe. The baselines of Block D (on A's channel) and E (on B's) are appended to A and B."""
+    if len(name) == 1 and name in "AB":
+        extra = {"A": "D", "B": "E"}[name]
+        if os.path.exists(os.path.join(DATA, f"ns3_campaign_{extra}.csv")):
+            return pd.concat([load_file(name), load_file(extra)], ignore_index=True)
+    return load_file(name)
+
+
+def load_file(name):
     df = pd.read_csv(os.path.join(DATA, f"ns3_campaign_{name}.csv"))
     df["pdr"] = df.uniqueChunks / df.totalChunks * 100.0
     best_effort = df["mode"].isin(["Mode1", "Mode2"])
     df["T"] = np.where(best_effort, df.lastNewS, df.senderDoneS)
-    bits = df.uniqueChunks * PAYLOAD_BITS
+    # delivered application bits: fraction of the message x message size (the baselines use other chunk sizes)
+    bits = df.uniqueChunks / df.totalChunks * MESSAGE_BITS
     ok = (df["T"] > 0) & (df.uniqueChunks > 0)
     df["goodput"] = np.where(ok, bits / df["T"].where(ok, 1.0), 0.0)
     t_dc = np.maximum(df["T"], df.senderTxAirS / DUTY)
@@ -112,6 +127,16 @@ def main():
            "Static channel: repair rounds (R_max = 5)", "A_rounds_snr.png",
            modes=("Mode3", "Mode4", "SWBase", "SWOpt"))
 
+    # Related protocols on the same channel and seeds (Block D)
+    if A["mode"].isin(["MPLR"]).any():
+        panels(A, "pdr", "PDR$_{app}$ (%)", "Static channel: LAMP, stop-and-wait, MPLR and LoRaMesher (50 seeds, 95 % CI)",
+               "A_pdr_snr_related.png", modes=RELATED, ylim=(-2, 102))
+        panels(A, "goodput", "Goodput (bit/s)", "Static channel: goodput of LAMP and related protocols",
+               "A_goodput_snr_related.png", modes=RELATED)
+        panels(A, "goodput_dc", "Goodput under 10 % duty cycle (bit/s)",
+               "Static channel: sustained goodput under 10 % duty cycle, LAMP and related protocols",
+               "A_goodput_dc_snr_related.png", modes=RELATED)
+
     # --- Block B: distance tables -----------------------------------------------------------------
     dist = B.groupby(["label", "sf", "meanSnrDb"]).distance.mean().rename("dist_km") / 1000.0
     B = B.join(dist, on=["label", "sf", "meanSnrDb"])
@@ -119,6 +144,13 @@ def main():
         modes = ("Mode4", "SWBase") if label.startswith("STRESS") else ("Mode1", "Mode3", "Mode4", "SWBase")
         panels(B[B.label == label], "pdr", "PDR$_{app}$ (%)", f"{label}: payload delivery ratio vs distance (95 % CI)",
                f"B_pdr_distance_{label}.png", x="dist_km", xlabel="Distance (km)", modes=modes, ylim=(-2, 102))
+
+    if B["mode"].isin(["MPLR"]).any():
+        for label in ["URBAN", "RURAL", "WATER"]:
+            panels(B[B.label == label], "pdr", "PDR$_{app}$ (%)",
+                   f"{label}: LAMP and related protocols, payload delivery ratio vs distance (95 % CI)",
+                   f"B_pdr_distance_{label}_related.png", x="dist_km", xlabel="Distance (km)", modes=RELATED,
+                   ylim=(-2, 102))
 
     # --- Summary tables ---------------------------------------------------------------------------
     rows = []
