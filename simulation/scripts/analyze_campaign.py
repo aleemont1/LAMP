@@ -36,8 +36,9 @@ STYLE = {  # mode -> (label, color, linestyle)
     "MPLR": ("MPLR (batch 40, BVACK)", "#9467bd", "-."),
     "LoRaMesher": ("LoRaMesher transfer (MIN_TIMEOUT 20 s)", "#8c564b", "-."),
     "LoRaMesherTight": ("LoRaMesher transfer (tight timeout)", "#e377c2", "-."),
+    "LoRaMesherR5": ("LoRaMesher transfer (5 retries, as LAMP)", "#17becf", "-."),
 }
-RELATED = ("Mode3", "Mode4", "SWBase", "MPLR", "LoRaMesher", "LoRaMesherTight")
+RELATED = ("Mode3", "Mode4", "SWBase", "MPLR", "LoRaMesher", "LoRaMesherTight", "LoRaMesherR5")
 
 
 def load(name):
