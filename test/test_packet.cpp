@@ -825,6 +825,78 @@ static void test_connection_payload_size_for_destination(void)
 }
 
 /**
+ * @brief Only the flag combinations of the protocol's flag table are valid; reserved bits and other combinations
+ * are rejected.
+ */
+static void test_validator_flag_whitelist(void)
+{
+  const uint8_t defined[] = {0x00, FLAG_ACK_REQ, FLAG_CONN_REQ, static_cast<uint8_t>(FLAG_CONN_REQ | FLAG_CONN_ACK),
+                             FLAG_CONN_ACK, FLAG_CONN_NACK};
+  for (uint8_t f : defined)
+  {
+    Packet p = create_valid_base_packet();
+    p.header.totalChunks = 1;
+    p.header.chunkIndex = 0;
+    p.header.payloadSize = (f == FLAG_CONN_ACK) ? 0 : 4;
+    p.header.flags = f;
+    p.calculateCRC();
+    TEST_ASSERT_FALSE(PacketValidator::validate(p).has_value());
+  }
+
+  const uint8_t undefined[] = {0x01, 0x02, 0x80, static_cast<uint8_t>(FLAG_ACK | FLAG_ACK_REQ),
+                               static_cast<uint8_t>(FLAG_CONN_REQ | FLAG_CONN_NACK),
+                               static_cast<uint8_t>(FLAG_CONN_ACK | FLAG_CONN_NACK),
+                               static_cast<uint8_t>(FLAG_ACK_REQ | FLAG_CONN_REQ)};
+  for (uint8_t f : undefined)
+  {
+    Packet p = create_valid_base_packet();
+    p.header.totalChunks = 1;
+    p.header.chunkIndex = 0;
+    p.header.payloadSize = 4;
+    p.header.flags = f;
+    p.calculateCRC();
+    auto err = PacketValidator::validate(p);
+    TEST_ASSERT_TRUE(err.has_value());
+    TEST_ASSERT_EQUAL(ValidationError::Type::INVALID_FLAGS, err.value().type);
+  }
+}
+
+/**
+ * @brief Control frames are single frames, the handshake ACK has no payload and a SACK carries 1..32 bitmap bytes.
+ */
+static void test_validator_control_frame_structure(void)
+{
+  Packet p = create_valid_base_packet();
+  p.header.flags = FLAG_ACK;  // SACK
+  p.header.totalChunks = 1;
+  p.header.chunkIndex = 0;
+  p.header.payloadSize = 32;
+  p.calculateCRC();
+  TEST_ASSERT_FALSE(PacketValidator::validate(p).has_value());
+
+  p.header.payloadSize = 33;  // more than ceil(255 / 8)
+  p.calculateCRC();
+  TEST_ASSERT_TRUE(PacketValidator::validate(p).has_value());
+
+  p.header.payloadSize = 0;  // an empty bitmap acknowledges nothing
+  p.calculateCRC();
+  TEST_ASSERT_TRUE(PacketValidator::validate(p).has_value());
+
+  p.header.payloadSize = 3;
+  p.header.totalChunks = 5;  // a SACK that claims to be chunk 0 of 5
+  p.calculateCRC();
+  TEST_ASSERT_TRUE(PacketValidator::validate(p).has_value());
+
+  Packet a = create_valid_base_packet();
+  a.header.flags = FLAG_CONN_ACK;
+  a.header.totalChunks = 1;
+  a.header.chunkIndex = 0;
+  a.header.payloadSize = 1;  // handshake ACK with a payload
+  a.calculateCRC();
+  TEST_ASSERT_TRUE(PacketValidator::validate(a).has_value());
+}
+
+/**
  * @brief A broadcast frame must not ask for an acknowledgment nor carry connection control: there is no single
  * receiver to answer, and every node would reply at once.
  */
@@ -1229,6 +1301,8 @@ int main(void)
   RUN_TEST(test_connection_payload_size_for_destination);
   RUN_TEST(test_broadcast_with_reliability_or_connection_flags_is_rejected);
   RUN_TEST(test_reliable_send_requires_unicast_destination);
+  RUN_TEST(test_validator_flag_whitelist);
+  RUN_TEST(test_validator_control_frame_structure);
   RUN_TEST(test_connection_activity_refreshed_by_peer_frames);
   RUN_TEST(test_connection_activity_not_refreshed_by_other_nodes);
   RUN_TEST(test_connection_activity_ignored_when_not_established);

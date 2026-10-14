@@ -797,8 +797,9 @@ void LoRaProtocol::handleIncomingPacket(const Packet &packet, uint32_t currentTi
 
     if (!isAlreadyCompleted)
     {
-      // Opening a session needs a free slot and enough heap for the whole message: refuse it explicitly instead of
-      // dropping the chunk silently (the sender gets no SACK and gives up after its retry budget).
+      // Opening a session needs a free slot and enough heap for the whole message. A connectionless message that does
+      // not fit is dropped silently: the sender gets no SACK and gives up after its retry budget (a SYN, instead, is
+      // answered with CONN_NACK(BUSY), see above).
       auto admission = reassembler_.admit(senderAddr, msgId, packet.header.totalChunks, freeHeapProvider_());
       if (admission != PacketReassembler::Admission::OK)
       {
