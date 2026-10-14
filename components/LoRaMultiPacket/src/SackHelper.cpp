@@ -26,6 +26,7 @@ std::vector<uint8_t> SackHelper::getMissingChunkIndices(const std::vector<uint8_
 Packet SackHelper::createSackPacket(uint16_t messageId, uint8_t totalChunks, const std::vector<uint8_t> &bitmap,
                                     uint8_t srcAddr, uint8_t dstAddr)
 {
+  static_cast<void>(totalChunks);  // kept in the signature: the SACK always describes a single-frame control message
   Packet ackPacket{};
   ackPacket.header.srcAddr = srcAddr;
   ackPacket.header.dstAddr = dstAddr;

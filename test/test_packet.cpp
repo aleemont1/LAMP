@@ -3,9 +3,12 @@
 #include <unity.h>
 
 #include <cstring>  // for memcmp
+#include <deque>
+#include <functional>
 #include <vector>
 
 #include "Connection.hpp"
+#include "LoRaProtocol.hpp"
 #include "Packet.hpp"
 #include "PacketDeserializer.hpp"
 #include "PacketParser.hpp"
@@ -1246,6 +1249,253 @@ void test_large_payload_duty_cycle_compliance(void)
   TEST_ASSERT_TRUE(actualDutyCycle <= 0.010001f);
 }
 
+// ============================================================================
+// Protocol state machine over a scripted radio and a manual clock
+// ============================================================================
+
+/** Radio that records transmitted frames and hands out scripted received frames. */
+class FakeRadio : public IRadio
+{
+ public:
+  std::deque<std::vector<uint8_t>> rx;       ///< frames waiting to be received
+  std::vector<Packet> sent;                  ///< every frame the node transmitted, parsed back
+  std::function<void(const Packet &)> onTx;  ///< scripted peer: called for every transmitted frame
+
+  int transmit(const uint8_t *data, size_t len) override
+  {
+    auto p = PacketParser::parse(data, len);
+    TEST_ASSERT_TRUE_MESSAGE(p.has_value(), "the node transmitted a frame its own parser rejects");
+    sent.push_back(p.value());
+    if (onTx)
+      onTx(p.value());
+    return RadioStatus::OK;
+  }
+  int startReceive() override { return RadioStatus::OK; }
+  int readData(uint8_t *data, size_t len) override
+  {
+    if (rx.empty())
+      return RadioStatus::FAILED;
+    std::memcpy(data, rx.front().data(), std::min(len, rx.front().size()));
+    rx.pop_front();
+    return RadioStatus::OK;
+  }
+  size_t getPacketLength() override { return rx.empty() ? 0 : rx.front().size(); }
+  uint32_t getIrqFlags() override { return rx.empty() ? 0 : RadioIrq::RX_DONE; }
+  void clearIrqFlags(uint32_t) override {}
+  uint64_t getTimeOnAirUs(size_t len) override { return 10000 + 1000 * static_cast<uint64_t>(len); }
+  float getRSSI() override { return -40.0f; }
+  float getSNR() override { return 10.0f; }
+  uint8_t randomByte() override { return 0x5A; }
+
+  void deliver(const Packet &p)
+  {
+    std::vector<uint8_t> raw(HEADER_SIZE + p.header.payloadSize + CRC_SIZE);
+    PacketSerializer::serialize(p, raw.data());
+    rx.push_back(raw);
+  }
+};
+
+/** Clock that only moves when the node waits; the offset models a time base that does not start at zero. */
+class FakeClock : public IPlatform
+{
+ public:
+  explicit FakeClock(FakeRadio &radio, uint32_t start = 0) : now(start), radio_(radio) {}
+  uint32_t now;
+  uint32_t millis() override { return now; }
+  void delay(uint32_t ms) override { now += ms; }
+  bool readIrqPin(uint32_t) override { return !radio_.rx.empty(); }
+
+ private:
+  FakeRadio &radio_;
+};
+
+static constexpr uint8_t kSelf = 0x01;
+static constexpr uint8_t kPeer = 0x02;
+
+static Packet makeFrame(uint8_t src, uint8_t dst, uint16_t msgId, uint8_t flags, uint8_t total, uint8_t idx,
+                        const std::vector<uint8_t> &payload)
+{
+  Packet p{};
+  p.header.srcAddr = src;
+  p.header.dstAddr = dst;
+  p.header.messageId = msgId;
+  p.header.totalChunks = total;
+  p.header.chunkIndex = idx;
+  p.header.flags = flags;
+  p.header.payloadSize = static_cast<uint8_t>(payload.size());
+  std::memcpy(p.payload.data, payload.data(), payload.size());
+  p.calculateCRC();
+  return p;
+}
+
+static Packet makeSynAck(uint8_t src, uint8_t dst, uint16_t msgId, uint8_t acceptedPayload)
+{
+  SynAckMetadata m{};
+  m.acceptedPayloadSize = acceptedPayload;
+  std::vector<uint8_t> raw(sizeof(m));
+  std::memcpy(raw.data(), &m, sizeof(m));
+  return makeFrame(src, dst, msgId, FLAG_CONN_REQ | FLAG_CONN_ACK, 1, 0, raw);
+}
+
+/** The peer answers the first SYN it sees with a SYN-ACK that accepts `acceptedPayload` bytes per chunk. */
+static void peerAcceptsSyn(FakeRadio &radio, uint8_t acceptedPayload)
+{
+  radio.onTx = [&radio, acceptedPayload](const Packet &p)
+  {
+    if (p.header.flags == FLAG_CONN_REQ)
+      radio.deliver(makeSynAck(kPeer, kSelf, p.header.messageId, acceptedPayload));
+  };
+}
+
+/**
+ * @brief The inactivity timer of a connection opened by connect() is on the same time base as update(): an update
+ * call whose argument comes from another clock (FreeRTOS ticks) must not close it.
+ */
+static void test_protocol_connection_survives_update_with_other_time_base(void)
+{
+  FakeRadio radio;
+  FakeClock clock(radio, 4000);  // the platform clock started before the tick counter
+  LoRaProtocol proto(&radio, &clock, 0, []()
+                     { return 7u; });
+  proto.setNodeAddress(kSelf);
+  peerAcceptsSyn(radio, 100);
+
+  TEST_ASSERT_TRUE(proto.connect(kPeer));
+  TEST_ASSERT_TRUE(proto.isConnected());
+
+  proto.update(10);  // "ticks since the scheduler started", smaller than the platform clock
+  TEST_ASSERT_TRUE(proto.isConnected());
+
+  clock.now += LoRaMultiPacketConfig::DEFAULT_CONN_INACTIVITY_TIMEOUT_MS + 1;
+  proto.update(0);
+  TEST_ASSERT_FALSE(proto.isConnected());  // real inactivity still closes it
+}
+
+/**
+ * @brief A SYN-ACK, a CONN_NACK or a stray CONN_ACK that arrive outside the handshake are not application data.
+ */
+static void test_protocol_control_frames_are_not_delivered_as_data(void)
+{
+  FakeRadio radio;
+  FakeClock clock(radio);
+  LoRaProtocol proto(&radio, &clock, 0, []()
+                     { return 7u; });
+  proto.setNodeAddress(kSelf);
+  int delivered = 0;
+  proto.setOnReceiveCallback([&delivered](const std::vector<uint8_t> &, float, float)
+                             { delivered++; });
+
+  radio.deliver(makeSynAck(kPeer, kSelf, 40, 100));
+  radio.deliver(makeFrame(kPeer, kSelf, 41, FLAG_CONN_NACK, 1, 0, {1}));
+  radio.deliver(makeFrame(kPeer, kSelf, 42, FLAG_CONN_ACK, 1, 0, {}));
+  for (int i = 0; i < 5; ++i)
+    proto.update(0);
+  TEST_ASSERT_EQUAL_INT(0, delivered);
+
+  // A real data frame still goes through.
+  radio.deliver(makeFrame(kPeer, kSelf, 43, 0, 1, 0, {9, 8, 7}));
+  proto.update(0);
+  TEST_ASSERT_EQUAL_INT(1, delivered);
+}
+
+/**
+ * @brief The payload size negotiated in the handshake is the one used for the chunks of the next message.
+ */
+static void test_protocol_uses_negotiated_payload_size(void)
+{
+  FakeRadio radio;
+  FakeClock clock(radio);
+  LoRaProtocol proto(&radio, &clock, 0, []()
+                     { return 7u; });
+  proto.setNodeAddress(kSelf);
+  peerAcceptsSyn(radio, 100);
+  TEST_ASSERT_TRUE(proto.connect(kPeer));
+
+  radio.sent.clear();
+  TEST_ASSERT_TRUE(proto.send(kPeer, std::vector<uint8_t>(250, 0xAB), false));  // unreliable: no SACK needed
+  size_t data = 0;
+  for (const auto &p : radio.sent)
+    if (p.header.flags == 0)
+      data++;
+  TEST_ASSERT_EQUAL_size_t(3, data);  // 250 B in chunks of 100 B
+}
+
+/**
+ * @brief Receiver admission (F3): a SYN is answered CONN_NACK(BUSY) when the heap margin is not there, and a
+ * connectionless message that does not fit is dropped without a SACK.
+ */
+static void test_protocol_admission_busy_and_silent_drop(void)
+{
+  FakeRadio radio;
+  FakeClock clock(radio);
+  LoRaProtocol proto(&radio, &clock, 0, []()
+                     { return 7u; });
+  proto.setNodeAddress(kSelf);
+  proto.setFreeHeapProvider([]()
+                            { return static_cast<size_t>(1024); });  // below the 16 kB margin
+  int delivered = 0;
+  proto.setOnReceiveCallback([&delivered](const std::vector<uint8_t> &, float, float)
+                             { delivered++; });
+
+  SynMetadata syn{};
+  std::vector<uint8_t> raw(sizeof(syn));
+  std::memcpy(raw.data(), &syn, sizeof(syn));
+  radio.deliver(makeFrame(kPeer, kSelf, 50, FLAG_CONN_REQ, 1, 0, raw));
+  proto.update(0);
+  TEST_ASSERT_EQUAL_size_t(1, radio.sent.size());
+  TEST_ASSERT_EQUAL_HEX8(FLAG_CONN_NACK, radio.sent[0].header.flags);
+  TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(ConnNackReason::BUSY), radio.sent[0].payload.data[0]);
+
+  radio.sent.clear();
+  radio.deliver(makeFrame(kPeer, kSelf, 51, FLAG_ACK_REQ, 1, 0, {1, 2, 3}));
+  proto.update(0);
+  TEST_ASSERT_EQUAL_size_t(0, radio.sent.size());  // no SACK, no NACK
+  TEST_ASSERT_EQUAL_INT(0, delivered);
+}
+
+/**
+ * @brief After a repair round the SACK timeout re-polls with the chunk that carried ACK_REQ (the last chunk
+ * reported missing), not with chunk N-1, so a lost polling chunk is repaired by the poll itself.
+ */
+static void test_protocol_timeout_poll_repeats_last_repaired_chunk(void)
+{
+  FakeRadio radio;
+  FakeClock clock(radio);
+  LoRaProtocol proto(&radio, &clock, 0, []()
+                     { return 7u; });
+  proto.setNodeAddress(kSelf);
+
+  // The peer holds chunks {0,1,3,4} of 5, loses the polling frame of the repair round (chunk 2), then answers.
+  int pollsSeen = 0;
+  uint16_t msgId = 0;
+  radio.onTx = [&](const Packet &p)
+  {
+    if (!(p.header.flags & FLAG_ACK_REQ))
+      return;
+    msgId = p.header.messageId;
+    pollsSeen++;
+    std::vector<uint8_t> bitmap(1, 0);
+    if (pollsSeen == 1)  // first burst: chunk 2 missing
+      bitmap[0] = 0b11011;
+    else if (pollsSeen == 2)
+      return;  // the repaired chunk 2 (carrying ACK_REQ) is lost: no SACK
+    else
+      bitmap[0] = 0b11111;
+    radio.deliver(makeFrame(kPeer, kSelf, msgId, FLAG_ACK, 1, 0, bitmap));
+  };
+
+  TEST_ASSERT_TRUE(proto.send(kPeer, std::vector<uint8_t>(5 * LORA_MAX_PAYLOAD_SIZE, 1), true));
+
+  std::vector<uint8_t> polls;  // chunk indices of the frames that carried ACK_REQ
+  for (const auto &p : radio.sent)
+    if (p.header.flags & FLAG_ACK_REQ)
+      polls.push_back(p.header.chunkIndex);
+  TEST_ASSERT_EQUAL_size_t(3, polls.size());
+  TEST_ASSERT_EQUAL_UINT8(4, polls[0]);  // end of the burst
+  TEST_ASSERT_EQUAL_UINT8(2, polls[1]);  // repair round
+  TEST_ASSERT_EQUAL_UINT8(2, polls[2]);  // timeout poll: the same chunk, not chunk 4
+}
+
 int main(void)
 {
   UNITY_BEGIN();
@@ -1303,6 +1553,13 @@ int main(void)
   RUN_TEST(test_reliable_send_requires_unicast_destination);
   RUN_TEST(test_validator_flag_whitelist);
   RUN_TEST(test_validator_control_frame_structure);
+
+  // Protocol state machine (scripted radio, manual clock)
+  RUN_TEST(test_protocol_connection_survives_update_with_other_time_base);
+  RUN_TEST(test_protocol_control_frames_are_not_delivered_as_data);
+  RUN_TEST(test_protocol_uses_negotiated_payload_size);
+  RUN_TEST(test_protocol_admission_busy_and_silent_drop);
+  RUN_TEST(test_protocol_timeout_poll_repeats_last_repaired_chunk);
   RUN_TEST(test_connection_activity_refreshed_by_peer_frames);
   RUN_TEST(test_connection_activity_not_refreshed_by_other_nodes);
   RUN_TEST(test_connection_activity_ignored_when_not_established);

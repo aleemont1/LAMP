@@ -1,9 +1,8 @@
 #pragma once
 
-#include <RadioLib.h>
-
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -13,7 +12,13 @@
 #include "PacketReassembler.hpp"
 #include "PacketSerializer.hpp"
 #include "ProtocolConfig.hpp"
+#include "Radio.hpp"
 #include "SackHelper.hpp"
+
+#if __has_include(<RadioLib.h>)
+#include "RadioLibAdapters.hpp"
+#define LORA_PROTOCOL_HAS_RADIOLIB 1
+#endif
 
 /**
  * @class LoRaProtocol
@@ -29,6 +34,14 @@ class LoRaProtocol
   using FreeHeapProvider = std::function<size_t()>;
 
   /**
+   * @brief Constructor over the radio and platform interfaces (host tests pass a scripted radio and a manual clock).
+   * @param irqPin Level source of the radio interrupt line, read through IPlatform::readIrqPin().
+   * @param randomSource Source of the random word that seeds the message ID counter; see the RadioLib constructor.
+   */
+  LoRaProtocol(IRadio *radio, IPlatform *platform, uint32_t irqPin, std::function<uint32_t()> randomSource = nullptr);
+
+#ifdef LORA_PROTOCOL_HAS_RADIOLIB
+  /**
    * @brief Constructor accepting the specific SX1262 driver, HAL pointer, and physical IRQ pin.
    * @param randomSource Source of the random word that seeds the message ID counter (default: the SX1262 random
    *        generator mixed with the ESP32 one). The counter is seeded on first use, not here, because the radio is
@@ -37,6 +50,7 @@ class LoRaProtocol
    */
   explicit LoRaProtocol(SX1262 *radio, RadioLibHal *hal, uint32_t irqPin,
                         std::function<uint32_t()> randomSource = nullptr);
+#endif
 
   /**
    * @brief Sets the local node address (0x01..0xFE).
@@ -97,6 +111,8 @@ class LoRaProtocol
 
   /**
    * @brief Main loop update. Handles RX polling, reassembly timeouts, and connection maintenance.
+   * @param currentTimestampMs Ignored: all timers use the platform clock (IPlatform::millis()), so that a connection
+   *        opened by connect() and the timers checked here are on one time base. Kept for source compatibility.
    */
   void update(uint32_t currentTimestampMs);
 
@@ -131,10 +147,12 @@ class LoRaProtocol
   void resetStats() { stats_ = ProtocolStats(); }
 
  private:
-  SX1262 *radio_;        ///< Pointer to SX1262 driver
-  RadioLibHal *hal_;     ///< Pointer to hardware HAL
-  uint32_t irqPin_;      ///< Hardware interrupt pin (e.g. DIO1)
-  uint8_t nodeAddress_;  ///< Local node address (0x00=Unassigned, 0x01..0xFE=Node, 0xFF=Broadcast)
+  std::unique_ptr<IRadio> ownedRadio_;        ///< adapter created by the RadioLib constructor
+  std::unique_ptr<IPlatform> ownedPlatform_;  ///< adapter created by the RadioLib constructor
+  IRadio *radio_;                             ///< transceiver
+  IPlatform *hal_;                            ///< clock, delays and interrupt line
+  uint32_t irqPin_;                           ///< Hardware interrupt pin (e.g. DIO1)
+  uint8_t nodeAddress_;                       ///< Local node address (0x00=Unassigned, 0x01..0xFE=Node, 0xFF=Broadcast)
   PacketReassembler reassembler_;
   ConnectionSession connection_;
   OnReceiveCallback onReceive_;
@@ -157,7 +175,6 @@ class LoRaProtocol
   void sendSynAck(uint8_t targetAddr, uint16_t msgId, const SynAckMetadata &synAck);
   void sendConnNack(uint8_t targetAddr, uint16_t msgId, ConnNackReason reason);
   bool waitForSynAck(uint8_t targetAddr, uint16_t msgId, uint32_t timeoutMs, SynAckMetadata &synAckOut);
-  bool waitForConnAck(uint16_t msgId, uint32_t timeoutMs);
 
   // Internal helper methods for transmission
   bool sendUnreliable(const std::vector<Packet> &packets);
