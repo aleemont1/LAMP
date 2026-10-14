@@ -228,6 +228,12 @@ bool LoRaProtocol::waitForSynAck(uint8_t targetAddr, uint16_t msgId, uint32_t ti
 
 	if ((pkt.header.flags & (FLAG_CONN_REQ | FLAG_CONN_ACK)) == (FLAG_CONN_REQ | FLAG_CONN_ACK))
 	{
+	  // Loss emulation on the return path (the frame is the one this node was waiting for)
+	  if (dropPacketCallback_ && dropPacketCallback_(pkt))
+	  {
+	    ESP_LOGW(TAG, "[SIMULATED LOSS] Artificially dropping SYN-ACK for MsgID %u", (unsigned)msgId);
+	    continue;
+	  }
 	  if (pkt.header.payloadSize >= sizeof(SynAckMetadata))
 	  {
 	    std::memcpy(&synAckOut, pkt.payload.data, sizeof(SynAckMetadata));
@@ -345,6 +351,9 @@ bool LoRaProtocol::sendReliable(const std::vector<Packet> &packets, size_t chunk
   }
 
   int retries = 0;
+  // Chunk that carried FLAG_ACK_REQ in the last round: the last chunk of the message after the initial burst, the
+  // last chunk reported missing after a repair round. A timeout re-sends it, so the poll also repairs it if it was lost.
+  uint8_t pollIdx = static_cast<uint8_t>(totalChunks - 1);
 
   while (true)
   {
@@ -376,6 +385,7 @@ bool LoRaProtocol::sendReliable(const std::vector<Packet> &packets, size_t chunk
       {
 	return false;
       }
+      pollIdx = missingIndices.back();
       retries++;
       continue;
     }
@@ -388,8 +398,8 @@ bool LoRaProtocol::sendReliable(const std::vector<Packet> &packets, size_t chunk
       return false;
     }
 
-    ESP_LOGW(TAG, "ACK timeout. Retrying last chunk (%u/%u)", (unsigned)retries, (unsigned)maxRetries);
-    Packet retryPkt = packets[totalChunks - 1];
+    ESP_LOGW(TAG, "ACK timeout. Re-polling with chunk %u (%u/%u)", (unsigned)pollIdx, (unsigned)retries, (unsigned)maxRetries);
+    Packet retryPkt = packets[pollIdx];
     retryPkt.header.flags |= FLAG_ACK_REQ;
     retryPkt.calculateCRC();
 
@@ -446,6 +456,13 @@ bool LoRaProtocol::waitForSack(uint8_t targetAddr, uint16_t msgId, uint32_t time
 	{
 	  ESP_LOGW(TAG, "Ignoring SACK for MsgID %u from unexpected node 0x%02X (expected 0x%02X)",
 	           msgId, (unsigned)packet.header.srcAddr, (unsigned)targetAddr);
+	  continue;
+	}
+
+	// Loss emulation on the return path (the frame is the SACK this node was waiting for)
+	if (dropPacketCallback_ && dropPacketCallback_(packet))
+	{
+	  ESP_LOGW(TAG, "[SIMULATED LOSS] Artificially dropping SACK for MsgID %u", (unsigned)msgId);
 	  continue;
 	}
 

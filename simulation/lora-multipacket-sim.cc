@@ -33,6 +33,7 @@ static const double P_TX_W = 0.118 * 3.3;  // 118mA @ +22dBm = 0.3894 W
 static const double P_RX_W = 0.0053 * 3.3; // 5.3mA active RX = 0.01749 W
 
 // Mirrors LoRaMultiPacketConfig (components/LoRaMultiPacket/include/ProtocolConfig.hpp)
+static const uint32_t CONN_INACTIVITY_MS = 15000;  // DEFAULT_CONN_INACTIVITY_TIMEOUT_MS (SYN timeoutMs field)
 static const uint32_t MAX_RETRIES = 5;               // R_max: repair-round budget
 static const uint32_t SYN_TIMEOUT_MS = 3000;         // DEFAULT_SYN_TIMEOUT_MS
 static const double MIN_ACK_TIMEOUT_MS = 1000.0;     // MIN_ACK_TIMEOUT_MS
@@ -66,6 +67,7 @@ struct ModeSpec {
     bool threeWay = true;                    // third message (ACK) of the handshake
     bool teardown = false;                   // FIN/ACK/FIN/ACK after the last acknowledgment
     uint32_t batchSize = 0;                  // BATCH_BVACK: packets per batch
+    bool batchBudget = false;                // BATCH_BVACK: R_max per batch of new frames instead of per transfer
     uint32_t maxRetries = MAX_RETRIES;       // repair-round budget (or per-chunk retries, stop-and-wait)
     double fixedTimeoutMs = 0.0;             // > 0: stop-and-wait timeout fixed by the library
 };
@@ -80,13 +82,13 @@ static bool ParseMode(const std::string &m, ModeSpec &s)
     if (m == "Mode2" || m == "UnreliableStream")                       { s = {true,  Proto::BEST_EFFORT, false}; return true; }
     if (m == "Mode3" || m == "ReliableDatagram" || m == "Reliable")    { s = {false, Proto::SACK, false};        return true; }
     if (m == "Mode4" || m == "ReliableStream")                         { s = {true,  Proto::SACK, false};        return true; }
-    if (m == "MPLR") {
+    if (m == "MPLR" || m == "MPLRBatch") {  // "Batch": R_max applies per batch (consecutive failed rounds)
         // 16 B header (EUIs 4+4, service 1, sequence 2, flag 1, payload size 1, batch size 1, checksum 2): no extra CRC,
         // 239 B of data, batches of up to 40 packets with one bit-vector ACK each, SYN/SYN-ACK, FIN/ACK/FIN/ACK.
         s = {};
         s.stateful = true; s.proto = Proto::BATCH_BVACK;
         s.headerBytes = 16; s.crcBytes = 0; s.chunkPayload = 255 - 16; s.synPayload = 0;
-        s.threeWay = false; s.teardown = true; s.batchSize = 40;
+        s.threeWay = false; s.teardown = true; s.batchSize = 40; s.batchBudget = (m == "MPLRBatch");
         return true;
     }
     if (m == "LoRaMesher" || m == "LoRaMesherTight" || m == "LoRaMesherR5") {
@@ -121,24 +123,44 @@ public:
     TypeId GetInstanceTypeId (void) const override { return GetTypeId (); }
     uint32_t GetSerializedSize (void) const override { return size; }
     void Print (std::ostream &os) const override { os << "flags=" << (int)flags << " chunk=" << (int)chunkIdx << "/" << (int)total; }
+    // Field order of Packet.hpp: srcAddr, dstAddr, messageId, totalChunks, chunkIndex, payloadSize, flags, version.
+    // The 8-bit LAMP fields are exact up to 255 chunks. The baselines have more chunks for the same message, so
+    // their high bytes (and the simulator's batch bookkeeping, which real MPLR derives from its sequence numbers)
+    // go in the padding up to the protocol's header size: GetSerializedSize() is unchanged for every protocol.
     void Serialize (Buffer::Iterator i) const override
     {
-        i.WriteU8 (LAMP_VERSION); i.WriteU8 (flags); i.WriteU8 (src); i.WriteU8 (dst);
-        i.WriteU16 (msgId); i.WriteU8 (chunkIdx); i.WriteU8 (total); i.WriteU8 (payloadLen);
-        // Padding up to the protocol's header size. The first two padding bytes carry simulator bookkeeping
-        // (batch number and position of the frame in its batch) that real MPLR derives from its sequence numbers.
-        for (uint32_t k = 9; k < size; ++k) i.WriteU8 (k == 9 ? batchId : (k == 10 ? batchPos : 0));
+        i.WriteU8 (src); i.WriteU8 (dst); i.WriteU16 (msgId);
+        i.WriteU8 (total & 0xFF); i.WriteU8 (chunkIdx & 0xFF); i.WriteU8 (payloadLen); i.WriteU8 (flags);
+        i.WriteU8 (LAMP_VERSION);
+        for (uint32_t k = 9; k < size; ++k)
+        {
+            uint8_t b = 0;
+            if (k == 9) b = chunkIdx >> 8;
+            else if (k == 10) b = total >> 8;
+            else if (k == 11) b = batchId;
+            else if (k == 12) b = batchPos;
+            i.WriteU8 (b);
+        }
     }
     uint32_t Deserialize (Buffer::Iterator i) override
     {
-        i.ReadU8 (); flags = i.ReadU8 (); src = i.ReadU8 (); dst = i.ReadU8 ();
-        msgId = i.ReadU16 (); chunkIdx = i.ReadU8 (); total = i.ReadU8 (); payloadLen = i.ReadU8 ();
-        for (uint32_t k = 9; k < size; ++k) { uint8_t b = i.ReadU8 (); if (k == 9) batchId = b; else if (k == 10) batchPos = b; }
+        src = i.ReadU8 (); dst = i.ReadU8 (); msgId = i.ReadU16 ();
+        total = i.ReadU8 (); chunkIdx = i.ReadU8 (); payloadLen = i.ReadU8 (); flags = i.ReadU8 ();
+        i.ReadU8 ();  // version
+        for (uint32_t k = 9; k < size; ++k)
+        {
+            uint8_t b = i.ReadU8 ();
+            if (k == 9) chunkIdx |= (uint16_t)b << 8;
+            else if (k == 10) total |= (uint16_t)b << 8;
+            else if (k == 11) batchId = b;
+            else if (k == 12) batchPos = b;
+        }
         return size;
     }
     uint32_t size = 9;  // serialized size: set to the protocol's header length before RemoveHeader
     uint8_t batchId = 0, batchPos = 0;
-    uint8_t flags = 0, src = 0, dst = 0, chunkIdx = 0, total = 0, payloadLen = 0;
+    uint8_t flags = 0, src = 0, dst = 0, payloadLen = 0;
+    uint16_t chunkIdx = 0, total = 0;
     uint16_t msgId = 1;
 };
 NS_OBJECT_ENSURE_REGISTERED (LampHeader);
@@ -226,7 +248,7 @@ public:
     }
 
     // Builds header + payload (+2 B CRC placeholder), transmits, returns time on air.
-    Time SendFrame(uint8_t flags, uint8_t chunkIdx, uint8_t total, const std::vector<uint8_t> &payload, uint32_t payloadLen,
+    Time SendFrame(uint8_t flags, uint16_t chunkIdx, uint16_t total, const std::vector<uint8_t> &payload, uint32_t payloadLen,
                    uint8_t batchId = 0, uint8_t batchPos = 0)
     {
         std::vector<uint8_t> body(payloadLen + m_spec.crcBytes, 0);
@@ -245,7 +267,7 @@ public:
         return onAir;
     }
 
-    void SendLater(Time delay, uint8_t flags, uint8_t chunkIdx, uint8_t total, std::vector<uint8_t> payload, uint32_t payloadLen)
+    void SendLater(Time delay, uint8_t flags, uint16_t chunkIdx, uint16_t total, std::vector<uint8_t> payload, uint32_t payloadLen)
     {
         Simulator::Schedule(delay, [this, flags, chunkIdx, total, payload, payloadLen]() {
             if (m_running) SendFrame(flags, chunkIdx, total, payload, payloadLen);
@@ -272,7 +294,7 @@ public:
 
     void SendSyn()
     {
-        Time onAir = SendFrame(FLAG_CONN_REQ, 0, 1, {(uint8_t)CHUNK_PAYLOAD, 255, 0, 0}, m_spec.synPayload);
+        Time onAir = SendFrame(FLAG_CONN_REQ, 0, 1, {(uint8_t)CHUNK_PAYLOAD, 1, (uint8_t)(CONN_INACTIVITY_MS & 0xFF), (uint8_t)(CONN_INACTIVITY_MS >> 8)}, m_spec.synPayload);
         m_timeoutEvent = Simulator::Schedule(onAir + MilliSeconds(SYN_TIMEOUT_MS), &MultiPacketNode::HandleSynTimeout, this);
     }
 
@@ -287,6 +309,7 @@ public:
     void StartData()
     {
         m_state = STATE_DATA_TX;
+        m_lastPoll = m_totalChunks - 1;
         m_pending.clear();
         for (uint32_t i = 0; i < m_totalChunks; ++i) m_pending.push_back(i);
         m_idx = 0;
@@ -330,7 +353,8 @@ public:
         if (!m_running || m_state != STATE_WAIT_SACK) return;
         if (m_rounds >= MAX_RETRIES) { Finish(false); return; }
         m_rounds++;
-        Time onAir = SendFrame(FLAG_ACK_REQ, m_totalChunks - 1, m_totalChunks, {}, ChunkLen(m_totalChunks - 1));
+        uint32_t poll = m_pollMissing ? m_lastPoll : m_totalChunks - 1;
+        Time onAir = SendFrame(FLAG_ACK_REQ, poll, m_totalChunks, {}, ChunkLen(poll));
         m_chunksTx++;
         m_timeoutEvent = Simulator::Schedule(onAir + MilliSeconds(POST_TX_GUARD_MS) + SackTimeout(), &MultiPacketNode::HandleSackTimeout, this);
     }
@@ -340,7 +364,7 @@ public:
     void OnSack(const std::vector<uint8_t> &bitmap)
     {
         Simulator::Cancel(m_timeoutEvent);
-        std::vector<uint8_t> missing;
+        std::vector<uint32_t> missing;
         for (uint32_t i = 0; i < m_totalChunks; ++i)
         {
             bool got = (i / 8 < bitmap.size()) && (bitmap[i / 8] & (1 << (i % 8)));
@@ -350,6 +374,7 @@ public:
         if (m_rounds >= MAX_RETRIES) { Finish(false); return; }
         m_rounds++;
         m_pending = missing;
+        m_lastPoll = missing.back();  // the frame carrying ACK_REQ in this repair round
         m_idx = 0;
         m_state = STATE_DATA_TX;
         SendNextBurstChunk();
@@ -390,7 +415,7 @@ public:
     void HandleBatchTimeout()
     {
         if (!m_running || m_state != STATE_WAIT_SACK) return;
-        if (m_rounds >= m_spec.maxRetries) { Finish(false); return; }
+        if (m_rounds >= BudgetLimit()) { Finish(false); return; }
         m_rounds++;
         size_t pos = m_batch.size() - 1;
         Time onAir = SendFrame(FLAG_ACK_REQ, m_batch[pos], m_batch.size(), {}, ChunkLen(m_batch[pos]), m_batchId, pos);
@@ -413,7 +438,7 @@ public:
         if (m_retx.empty() && m_nextNew >= m_totalChunks) { StartTeardown(); return; }
         if (!m_retx.empty())
         {
-            if (m_rounds >= m_spec.maxRetries) { Finish(false); return; }
+            if (m_rounds >= BudgetLimit()) { Finish(false); return; }
             m_rounds++;
         }
         StartBatch();
@@ -462,7 +487,7 @@ public:
         SendSwChunk();
     }
 
-    void OnSwAck(uint8_t chunkIdx)
+    void OnSwAck(uint16_t chunkIdx)
     {
         if (m_state != STATE_WAIT_SACK || chunkIdx != m_swCur) return; // stale ACK
         Simulator::Cancel(m_timeoutEvent);
@@ -488,6 +513,9 @@ public:
         if (h.dst != m_nodeAddress) return;
         // Loss emulation mirrors the bench receiver's DropPacketCallback: every frame except SACK/ACK is dropped with probability p.
         if (!m_isSender && m_lossProb > 0.0 && !(h.flags & FLAG_ACK) && m_lossRng->GetValue() < m_lossProb) return;
+
+        if (m_isSender && m_lossAckProb > 0.0 && ((h.flags & FLAG_ACK) || ((h.flags & FLAG_CONN_REQ) && (h.flags & FLAG_CONN_ACK))) &&
+            m_lossRng->GetValue() < m_lossAckProb) return;
 
         std::vector<uint8_t> body(p->GetSize(), 0);
         p->CopyData(body.data(), body.size());
@@ -529,7 +557,7 @@ public:
         // Receiver
         if ((h.flags & FLAG_CONN_REQ) && !(h.flags & FLAG_CONN_ACK))
         {
-            SendLater(MilliSeconds(GUARD_MS), FLAG_CONN_REQ | FLAG_CONN_ACK, 0, 1, {(uint8_t)CHUNK_PAYLOAD, 255, 0, 0}, m_spec.synPayload);
+            SendLater(MilliSeconds(GUARD_MS), FLAG_CONN_REQ | FLAG_CONN_ACK, 0, 1, {(uint8_t)CHUNK_PAYLOAD, 1, 0, 0}, m_spec.synPayload);
             return;
         }
         if (h.flags & FLAG_FIN)
@@ -607,11 +635,21 @@ public:
     // MPLR receiver
     uint8_t m_rxBatchId = 0;
     std::vector<bool> m_batchRx;
-    std::vector<uint8_t> m_pending;
+    std::vector<uint32_t> m_pending;
     size_t m_idx = 0;
     uint32_t m_swCur = 0;
     uint32_t m_swRetries = 0;
     uint32_t m_synRetries = 0;
+    // MPLR repair budget: R_max for the whole transfer or, for "MPLRBatch", R_max for each batch of new frames
+    // (pooled: the transfer may spend R_max rounds per batch it needs).
+    uint32_t BudgetLimit() const
+    {
+        if (!m_spec.batchBudget) return m_spec.maxRetries;
+        return m_spec.maxRetries * ((m_totalChunks + m_spec.batchSize - 1) / m_spec.batchSize);
+    }
+    bool m_pollMissing = false;  // timeout poll: re-send the last chunk repaired instead of chunk N-1
+    uint32_t m_lastPoll = 0;
+    double m_lossAckProb = 0.0;      // acknowledgment frames (SACK/ACK, SYN-ACK) lost on their way to the sender
     uint32_t m_rounds = 0;      // repair rounds used (timeouts + SACK-with-gaps, or stop-and-wait retries)
     bool m_senderOk = false;
 
@@ -647,6 +685,8 @@ int main(int argc, char *argv[])
     // Optional channel overrides (negative = keep the per-environment default below)
     double nOverride = -1.0, plRefOverride = -1.0, mOverride = -1.0, sigmaOverride = -1.0;
     double lossProb = 0.0;
+    double lossAckProb = 0.0;
+    bool pollMissing = true;
 
     CommandLine cmd;
     cmd.AddValue ("distance", "Distance between nodes in meters", distance);
@@ -661,6 +701,8 @@ int main(int argc, char *argv[])
     cmd.AddValue ("pl1km", "Path loss at 1 km override, dB", plRefOverride);
     cmd.AddValue ("m", "Nakagami m override", mOverride);
     cmd.AddValue ("loss", "Receiver-side frame drop probability 0..1 (bench emulation; SACK/ACK frames exempt)", lossProb);
+    cmd.AddValue ("lossAck", "Probability that an acknowledgment frame (SACK/ACK, SYN-ACK) is lost before reaching the sender", lossAckProb);
+    cmd.AddValue ("pollMissing", "LAMP timeout poll re-sends the chunk that carried ACK_REQ in the last round (1, as the firmware) instead of chunk N-1 (0, legacy)", pollMissing);
     cmd.AddValue ("sigma", "Log-normal shadowing std-dev override, dB (0 = none)", sigmaOverride);
     cmd.Parse (argc, argv);
 
@@ -754,6 +796,8 @@ int main(int argc, char *argv[])
     app1->Setup(dev1->GetPhy(), 0x02, 0x01, false, spec, totalChunks, appBytes);
     app1->SetTxParams(sf, txPowerDbm, bandwidthHz);
     app1->m_lossProb = lossProb;
+    app0->m_lossAckProb = lossAckProb;
+    app0->m_pollMissing = pollMissing;
 
     nodes.Get(0)->AddApplication(app0);
     nodes.Get(1)->AddApplication(app1);
