@@ -2,7 +2,8 @@
 // Driven by simulation/scripts/bench_hw.py. 869.525 MHz, BW 125 kHz, CR 4/5, 8-symbol preamble.
 //
 // RX commands : "SF <n>", "DROP <percent>"          (drops data/handshake frames, never SACKs, like the simulator's --loss)
-// TX commands : "SF <n>", "TRIAL <mode 1-4> <chunks>"
+// TX commands : "SF <n>", "DROPACK <percent>" (drops SACK and SYN-ACK frames before the transmitter sees them),
+//               "TRIAL <mode 1-4> <chunks>"
 // Output lines (CSV, prefixed): RXF (every frame seen by the RX), RXMSG (message completed), TX (one trial result).
 #ifdef RUN_BENCH
 #include <RadioLib.h>
@@ -34,7 +35,8 @@ LoRaProtocol *protocol = &protocol_inst;
 static const uint8_t ADDR_TX = 0x01;
 static const uint8_t ADDR_RX = 0x02;
 static const int MAX_CONNECT_ATTEMPTS = 1 + LoRaMultiPacketConfig::MAX_RETRIES;  // simulator: SYN + R_max resends
-static int dropPercent = 0;
+static int dropPercent = 0;     // RX: data and handshake frames dropped before the protocol
+static int dropAckPercent = 0;  // TX: SACK and SYN-ACK frames dropped before the protocol
 static int currentSf = 7;
 
 // ---- OLED status (updated by a low-priority task on core 1; never touches the protocol timing) ----
@@ -225,6 +227,9 @@ extern "C" void app_main(void)
 
 #else  // NODE_MODE_TX
   protocol->setNodeAddress(ADDR_TX);
+  // The transmitter's callback is only consulted for the frames it waits for (SACK, SYN-ACK).
+  protocol->setDropPacketCallback([](const Packet &) -> bool
+                                  { return dropAckPercent > 0 && static_cast<int>(esp_random() % 100) < dropAckPercent; });
   printf("READY,TX\n");
 
   std::string line;
@@ -250,6 +255,11 @@ extern "C" void app_main(void)
     else if (line.compare(0, 5, "NOTE ") == 0)
     {
       std::snprintf(note, sizeof(note), "%s", line.c_str() + 5);
+    }
+    else if (std::sscanf(line.c_str(), "DROPACK %d", &a) == 1)
+    {
+      dropAckPercent = a;
+      printf("OK,DROPACK,%d\n", a);
     }
     else if (std::sscanf(line.c_str(), "TRIAL %d %d", &a, &b) == 2)
     {

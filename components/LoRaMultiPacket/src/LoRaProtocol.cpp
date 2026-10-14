@@ -228,6 +228,12 @@ bool LoRaProtocol::waitForSynAck(uint8_t targetAddr, uint16_t msgId, uint32_t ti
 
 	if ((pkt.header.flags & (FLAG_CONN_REQ | FLAG_CONN_ACK)) == (FLAG_CONN_REQ | FLAG_CONN_ACK))
 	{
+	  // Loss emulation on the return path (the frame is the one this node was waiting for)
+	  if (dropPacketCallback_ && dropPacketCallback_(pkt))
+	  {
+	    ESP_LOGW(TAG, "[SIMULATED LOSS] Artificially dropping SYN-ACK for MsgID %u", (unsigned)msgId);
+	    continue;
+	  }
 	  if (pkt.header.payloadSize >= sizeof(SynAckMetadata))
 	  {
 	    std::memcpy(&synAckOut, pkt.payload.data, sizeof(SynAckMetadata));
@@ -446,6 +452,13 @@ bool LoRaProtocol::waitForSack(uint8_t targetAddr, uint16_t msgId, uint32_t time
 	{
 	  ESP_LOGW(TAG, "Ignoring SACK for MsgID %u from unexpected node 0x%02X (expected 0x%02X)",
 	           msgId, (unsigned)packet.header.srcAddr, (unsigned)targetAddr);
+	  continue;
+	}
+
+	// Loss emulation on the return path (the frame is the SACK this node was waiting for)
+	if (dropPacketCallback_ && dropPacketCallback_(packet))
+	{
+	  ESP_LOGW(TAG, "[SIMULATED LOSS] Artificially dropping SACK for MsgID %u", (unsigned)msgId);
 	  continue;
 	}
 
