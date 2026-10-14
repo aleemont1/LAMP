@@ -139,7 +139,7 @@ bool PacketReassembler::isCompleted(uint8_t srcAddr, uint16_t messageId, uint32_
                      [&](const CompletedEntry &entry)
                      {
                        return entry.key == key &&
-		              currentTimestampMs - entry.completedTime <= LoRaMultiPacketConfig::COMPLETED_HISTORY_TTL_MS;
+		              currentTimestampMs - entry.completedTime <= completedTtlMs_;
                      });
 }
 
