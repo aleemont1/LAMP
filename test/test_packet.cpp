@@ -1261,8 +1261,12 @@ class FakeRadio : public IRadio
   std::vector<Packet> sent;                  ///< every frame the node transmitted, parsed back
   std::function<void(const Packet &)> onTx;  ///< scripted peer: called for every transmitted frame
 
+  bool failTransmit = false;  ///< the transceiver refuses to transmit
+
   int transmit(const uint8_t *data, size_t len) override
   {
+    if (failTransmit)
+      return RadioStatus::FAILED;
     auto p = PacketParser::parse(data, len);
     TEST_ASSERT_TRUE_MESSAGE(p.has_value(), "the node transmitted a frame its own parser rejects");
     sent.push_back(p.value());
@@ -1311,6 +1315,8 @@ class FakeClock : public IPlatform
 
 static constexpr uint8_t kSelf = 0x01;
 static constexpr uint8_t kPeer = 0x02;
+static constexpr uint8_t kThird = 0x09;
+static constexpr uint8_t kHigh = 0x05;
 
 static Packet makeFrame(uint8_t src, uint8_t dst, uint16_t msgId, uint8_t flags, uint8_t total, uint8_t idx,
                         const std::vector<uint8_t> &payload)
@@ -1496,6 +1502,213 @@ static void test_protocol_timeout_poll_repeats_last_repaired_chunk(void)
   TEST_ASSERT_EQUAL_UINT8(2, polls[2]);  // timeout poll: the same chunk, not chunk 4
 }
 
+static Packet makeSyn(uint8_t src, uint8_t dst, uint16_t msgId, uint16_t timeoutMs = 15000, uint8_t payload = 100)
+{
+  SynMetadata m{};
+  m.requestedPayloadSize = payload;
+  m.timeoutMs = timeoutMs;
+  std::vector<uint8_t> raw(sizeof(m));
+  std::memcpy(raw.data(), &m, sizeof(m));
+  return makeFrame(src, dst, msgId, FLAG_CONN_REQ, 1, 0, raw);
+}
+
+/** Simultaneous open, this node has the lower address: it answers the peer's SYN BUSY and keeps its own handshake. */
+static void test_protocol_simultaneous_open_lower_address_wins(void)
+{
+  FakeRadio radio;
+  FakeClock clock(radio);
+  LoRaProtocol proto(&radio, &clock, 0, []()
+                     { return 7u; });
+  proto.setNodeAddress(0x01);
+  radio.onTx = [&radio](const Packet &p)
+  {
+    if (p.header.flags == FLAG_CONN_REQ && p.header.dstAddr == 0x02)
+    {
+      radio.deliver(makeSyn(0x02, 0x01, 777));                         // the peer's own SYN
+      radio.deliver(makeSynAck(0x02, 0x01, p.header.messageId, 100));  // its answer to ours
+    }
+  };
+
+  TEST_ASSERT_TRUE(proto.connect(kPeer));
+  TEST_ASSERT_TRUE(proto.isConnected());
+  TEST_ASSERT_EQUAL_size_t(3, radio.sent.size());
+  TEST_ASSERT_EQUAL_HEX8(FLAG_CONN_REQ, radio.sent[0].header.flags);
+  TEST_ASSERT_EQUAL_HEX8(FLAG_CONN_NACK, radio.sent[1].header.flags);
+  TEST_ASSERT_EQUAL_UINT16(777, radio.sent[1].header.messageId);
+  TEST_ASSERT_EQUAL_UINT8(static_cast<uint8_t>(ConnNackReason::BUSY), radio.sent[1].payload.data[0]);
+  TEST_ASSERT_EQUAL_HEX8(FLAG_CONN_ACK, radio.sent[2].header.flags);
+}
+
+/** Simultaneous open, this node has the higher address: it yields, accepts the peer's SYN and waits for its ACK. */
+static void test_protocol_simultaneous_open_higher_address_yields(void)
+{
+  FakeRadio radio;
+  FakeClock clock(radio);
+  LoRaProtocol proto(&radio, &clock, 0, []()
+                     { return 7u; });
+  proto.setNodeAddress(0x05);
+  radio.onTx = [&radio](const Packet &p)
+  {
+    if (p.header.flags == FLAG_CONN_REQ)
+      radio.deliver(makeSyn(0x02, 0x05, 777));  // the peer's SYN crosses ours
+    else if (p.header.flags == (FLAG_CONN_REQ | FLAG_CONN_ACK))
+      radio.deliver(makeFrame(0x02, 0x05, 777, FLAG_CONN_ACK, 1, 0, {}));  // the peer completes its handshake
+  };
+
+  TEST_ASSERT_TRUE(proto.connect(kPeer));
+  TEST_ASSERT_TRUE(proto.isConnected());
+  TEST_ASSERT_EQUAL_size_t(2, radio.sent.size());  // our SYN and the SYN-ACK to the peer's SYN, no final ACK of ours
+  TEST_ASSERT_EQUAL_HEX8(FLAG_CONN_REQ, radio.sent[0].header.flags);
+  TEST_ASSERT_EQUAL_HEX8(FLAG_CONN_REQ | FLAG_CONN_ACK, radio.sent[1].header.flags);
+  TEST_ASSERT_EQUAL_UINT16(777, radio.sent[1].header.messageId);
+}
+
+/** A SYN while connect() is waiting that comes from a third node is answered BUSY and does not disturb the wait. */
+static void test_protocol_third_node_syn_during_connect_gets_busy(void)
+{
+  FakeRadio radio;
+  FakeClock clock(radio);
+  LoRaProtocol proto(&radio, &clock, 0, []()
+                     { return 7u; });
+  proto.setNodeAddress(0x01);
+  radio.onTx = [&radio](const Packet &p)
+  {
+    if (p.header.flags == FLAG_CONN_REQ && p.header.dstAddr == 0x02)
+    {
+      radio.deliver(makeSyn(0x09, 0x01, 500));
+      radio.deliver(makeSynAck(0x02, 0x01, p.header.messageId, 100));
+    }
+  };
+  TEST_ASSERT_TRUE(proto.connect(kPeer));
+  bool busyToThird = false;
+  for (const auto &p : radio.sent)
+    busyToThird |= p.header.flags == FLAG_CONN_NACK && p.header.dstAddr == 0x09 && p.header.messageId == 500;
+  TEST_ASSERT_TRUE(busyToThird);
+}
+
+/** If the final ACK is lost, the first data frame of the peer (its own message ID) completes the handshake. */
+static void test_protocol_data_frame_promotes_syn_rcvd(void)
+{
+  FakeRadio radio;
+  FakeClock clock(radio);
+  LoRaProtocol proto(&radio, &clock, 0, []()
+                     { return 7u; });
+  proto.setNodeAddress(kSelf);
+
+  radio.deliver(makeSyn(kPeer, kSelf, 90));
+  proto.update(0);
+  TEST_ASSERT_TRUE(proto.getConnectionState() == ConnectionState::SYN_RCVD);
+
+  radio.deliver(makeFrame(kPeer, kSelf, 91, 0, 1, 0, {1, 2, 3}));  // data: message ID differs from the SYN's
+  proto.update(0);
+  TEST_ASSERT_TRUE(proto.isConnected());
+}
+
+/** The inactivity timeout a peer asks for is bounded: neither 1 ms nor 65 s. */
+static void test_protocol_peer_timeout_request_is_bounded(void)
+{
+  const uint16_t requests[] = {65535, 1};
+  const uint32_t expected[] = {LoRaMultiPacketConfig::MAX_CONN_INACTIVITY_TIMEOUT_MS,
+                               LoRaMultiPacketConfig::MIN_CONN_INACTIVITY_TIMEOUT_MS};
+  for (int i = 0; i < 2; ++i)
+  {
+    FakeRadio radio;
+    FakeClock clock(radio, 1000);
+    LoRaProtocol proto(&radio, &clock, 0, []()
+                       { return 7u; });
+    proto.setNodeAddress(kSelf);
+    radio.deliver(makeSyn(kPeer, kSelf, 90, requests[i]));
+    proto.update(0);
+    radio.deliver(makeFrame(kPeer, kSelf, 90, FLAG_CONN_ACK, 1, 0, {}));
+    proto.update(0);
+    TEST_ASSERT_TRUE(proto.isConnected());
+
+    clock.now += expected[i] - 100;  // just inside the bound
+    proto.update(0);
+    TEST_ASSERT_TRUE(proto.isConnected());
+    clock.now += 200;  // just past it
+    proto.update(0);
+    TEST_ASSERT_FALSE(proto.isConnected());
+  }
+}
+
+/** One connection per node: connect() reuses the one to the same peer and refuses a second peer. */
+static void test_protocol_connect_does_not_overwrite_active_connection(void)
+{
+  FakeRadio radio;
+  FakeClock clock(radio);
+  LoRaProtocol proto(&radio, &clock, 0, []()
+                     { return 7u; });
+  proto.setNodeAddress(kSelf);
+  peerAcceptsSyn(radio, 100);
+  TEST_ASSERT_TRUE(proto.connect(kPeer));
+
+  radio.sent.clear();
+  TEST_ASSERT_TRUE(proto.connect(kPeer));    // already connected: nothing to do
+  TEST_ASSERT_FALSE(proto.connect(kThird));  // another peer: refused
+  TEST_ASSERT_EQUAL_size_t(0, radio.sent.size());
+  TEST_ASSERT_TRUE(proto.isConnected());
+}
+
+/** A SACK addressed to another node is not ours, even with our message ID and the right source. */
+static void test_protocol_ignores_sack_for_other_node(void)
+{
+  FakeRadio radio;
+  FakeClock clock(radio);
+  LoRaProtocol proto(&radio, &clock, 0, []()
+                     { return 7u; });
+  proto.setNodeAddress(kSelf);
+  int polls = 0;
+  radio.onTx = [&](const Packet &p)
+  {
+    if (!(p.header.flags & FLAG_ACK_REQ))
+      return;
+    polls++;
+    const uint8_t dst = (polls == 1) ? 0x09 : kSelf;  // the first answer is meant for somebody else
+    radio.deliver(makeFrame(kPeer, dst, p.header.messageId, FLAG_ACK, 1, 0, {0xFF}));
+  };
+  TEST_ASSERT_TRUE(proto.send(kPeer, std::vector<uint8_t>(40, 1), true));
+  TEST_ASSERT_EQUAL_INT(2, polls);  // the misaddressed SACK did not complete the send
+}
+
+/** A handshake frame that cannot be transmitted ends connect() at once, not after the SYN-ACK timeout. */
+static void test_protocol_connect_fails_fast_when_transmit_fails(void)
+{
+  FakeRadio radio;
+  FakeClock clock(radio, 100);
+  LoRaProtocol proto(&radio, &clock, 0, []()
+                     { return 7u; });
+  proto.setNodeAddress(kSelf);
+  radio.failTransmit = true;
+  TEST_ASSERT_FALSE(proto.connect(kPeer));
+  TEST_ASSERT_TRUE(clock.now - 100 < LoRaMultiPacketConfig::DEFAULT_SYN_TIMEOUT_MS);
+  TEST_ASSERT_FALSE(proto.isConnected());
+}
+
+/** The completed-message history keeps duplicates out for the TTL it is given. */
+static void test_reassembler_completed_history_ttl_is_settable(void)
+{
+  PacketReassembler r;
+  r.markCompleted(kPeer, 5, 0);
+  TEST_ASSERT_TRUE(r.isCompleted(kPeer, 5, 100000));
+  TEST_ASSERT_FALSE(r.isCompleted(kPeer, 5, 150000));  // default TTL is 120 s
+  r.setCompletedHistoryTtl(200000);
+  TEST_ASSERT_TRUE(r.isCompleted(kPeer, 5, 150000));
+  TEST_ASSERT_FALSE(r.isCompleted(kPeer, 5, 250000));
+}
+
+/** serialize() with a capacity never writes outside it and refuses an impossible payload size. */
+static void test_serializer_checks_capacity(void)
+{
+  Packet p = makeFrame(kSelf, kPeer, 1, 0, 1, 0, std::vector<uint8_t>(10, 7));
+  uint8_t buf[64];
+  TEST_ASSERT_EQUAL_size_t(HEADER_SIZE + 10 + CRC_SIZE, PacketSerializer::serialize(p, buf, sizeof(buf)));
+  TEST_ASSERT_EQUAL_size_t(0, PacketSerializer::serialize(p, buf, HEADER_SIZE + 10 + CRC_SIZE - 1));
+  p.header.payloadSize = static_cast<uint8_t>(LORA_MAX_PAYLOAD_SIZE + 1);
+  uint8_t big[300];
+  TEST_ASSERT_EQUAL_size_t(0, PacketSerializer::serialize(p, big, sizeof(big)));
+}
+
 int main(void)
 {
   UNITY_BEGIN();
@@ -1560,6 +1773,16 @@ int main(void)
   RUN_TEST(test_protocol_uses_negotiated_payload_size);
   RUN_TEST(test_protocol_admission_busy_and_silent_drop);
   RUN_TEST(test_protocol_timeout_poll_repeats_last_repaired_chunk);
+  RUN_TEST(test_protocol_simultaneous_open_lower_address_wins);
+  RUN_TEST(test_protocol_simultaneous_open_higher_address_yields);
+  RUN_TEST(test_protocol_third_node_syn_during_connect_gets_busy);
+  RUN_TEST(test_protocol_data_frame_promotes_syn_rcvd);
+  RUN_TEST(test_protocol_peer_timeout_request_is_bounded);
+  RUN_TEST(test_protocol_connect_does_not_overwrite_active_connection);
+  RUN_TEST(test_protocol_ignores_sack_for_other_node);
+  RUN_TEST(test_protocol_connect_fails_fast_when_transmit_fails);
+  RUN_TEST(test_reassembler_completed_history_ttl_is_settable);
+  RUN_TEST(test_serializer_checks_capacity);
   RUN_TEST(test_connection_activity_refreshed_by_peer_frames);
   RUN_TEST(test_connection_activity_not_refreshed_by_other_nodes);
   RUN_TEST(test_connection_activity_ignored_when_not_established);
