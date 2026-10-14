@@ -686,7 +686,7 @@ int main(int argc, char *argv[])
     double nOverride = -1.0, plRefOverride = -1.0, mOverride = -1.0, sigmaOverride = -1.0;
     double lossProb = 0.0;
     double lossAckProb = 0.0;
-    bool pollMissing = false;
+    bool pollMissing = true;
 
     CommandLine cmd;
     cmd.AddValue ("distance", "Distance between nodes in meters", distance);
@@ -702,7 +702,7 @@ int main(int argc, char *argv[])
     cmd.AddValue ("m", "Nakagami m override", mOverride);
     cmd.AddValue ("loss", "Receiver-side frame drop probability 0..1 (bench emulation; SACK/ACK frames exempt)", lossProb);
     cmd.AddValue ("lossAck", "Probability that an acknowledgment frame (SACK/ACK, SYN-ACK) is lost before reaching the sender", lossAckProb);
-    cmd.AddValue ("pollMissing", "LAMP timeout poll re-sends the last chunk repaired (1) instead of chunk N-1 (0)", pollMissing);
+    cmd.AddValue ("pollMissing", "LAMP timeout poll re-sends the chunk that carried ACK_REQ in the last round (1, as the firmware) instead of chunk N-1 (0, legacy)", pollMissing);
     cmd.AddValue ("sigma", "Log-normal shadowing std-dev override, dB (0 = none)", sigmaOverride);
     cmd.Parse (argc, argv);
 

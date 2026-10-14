@@ -120,19 +120,20 @@ def jobs_F():
 LOSS_G = [0, 10, 20, 30, 40, 50]
 
 
-def jobs_G(poll=0):
+def jobs_G(legacy=False):
     """Loss of acknowledgments (SACK/ACK, SYN-ACK) on top of the bench's data/handshake-frame loss, SF7.
-    poll=1 re-sends, on a timeout, the last chunk repaired instead of chunk N-1 (Block H)."""
-    for p, pa, mode, seed in itertools.product(LOSS_G, LOSS_G, ["Mode3", "Mode4"] if poll else ["Mode3", "Mode4", "SWBase"], SEEDS):
-        yield (f"{'H' if poll else 'G'}_loss{p}_ack{pa}", 100.0, mode, 7, "LOS", seed,
-               ["--sigma=0", "--m=50", f"--loss={p / 100}", f"--lossAck={pa / 100}"] + (["--pollMissing=1"] if poll else []))
+    legacy=True re-sends chunk N-1 on a timeout instead of the chunk that carried ACK_REQ (Block H, ablation)."""
+    modes = ["Mode3", "Mode4"] if legacy else ["Mode3", "Mode4", "SWBase"]
+    for p, pa, mode, seed in itertools.product(LOSS_G, LOSS_G, modes, SEEDS):
+        yield (f"{'H' if legacy else 'G'}_loss{p}_ack{pa}", 100.0, mode, 7, "LOS", seed,
+               ["--sigma=0", "--m=50", f"--loss={p / 100}", f"--lossAck={pa / 100}"] + (["--pollMissing=0"] if legacy else []))
 
 
 def jobs_H():
-    yield from jobs_G(poll=1)
+    yield from jobs_G(legacy=True)
     for snr, mode, seed in itertools.product(range(-18, -8), ["Mode3", "Mode4"], SEEDS):
         yield ("H_STATIC", distance_for_snr(snr, *FREE_SPACE), mode, 7, "LOS", seed,
-               ["--sigma=0", "--m=50", "--pollMissing=1"])
+               ["--sigma=0", "--m=50", "--pollMissing=0"])
 
 
 def run(job):

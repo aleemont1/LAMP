@@ -351,6 +351,9 @@ bool LoRaProtocol::sendReliable(const std::vector<Packet> &packets, size_t chunk
   }
 
   int retries = 0;
+  // Chunk that carried FLAG_ACK_REQ in the last round: the last chunk of the message after the initial burst, the
+  // last chunk reported missing after a repair round. A timeout re-sends it, so the poll also repairs it if it was lost.
+  uint8_t pollIdx = static_cast<uint8_t>(totalChunks - 1);
 
   while (true)
   {
@@ -382,6 +385,7 @@ bool LoRaProtocol::sendReliable(const std::vector<Packet> &packets, size_t chunk
       {
 	return false;
       }
+      pollIdx = missingIndices.back();
       retries++;
       continue;
     }
@@ -394,8 +398,8 @@ bool LoRaProtocol::sendReliable(const std::vector<Packet> &packets, size_t chunk
       return false;
     }
 
-    ESP_LOGW(TAG, "ACK timeout. Retrying last chunk (%u/%u)", (unsigned)retries, (unsigned)maxRetries);
-    Packet retryPkt = packets[totalChunks - 1];
+    ESP_LOGW(TAG, "ACK timeout. Re-polling with chunk %u (%u/%u)", (unsigned)pollIdx, (unsigned)retries, (unsigned)maxRetries);
+    Packet retryPkt = packets[pollIdx];
     retryPkt.header.flags |= FLAG_ACK_REQ;
     retryPkt.calculateCRC();
 
