@@ -24,9 +24,7 @@ std::optional<Packet> PacketParser::parse(const uint8_t *buffer, size_t length)
     return std::nullopt;
   }
 
-  Packet packet;
-  // Clear the struct to avoid garbage in padding
-  std::memset(&packet, 0, sizeof(Packet));
+  Packet packet{};  // value-initialised: no garbage in the padding
 
   // 2. Header Extraction
   std::memcpy(&packet.header, buffer, HEADER_SIZE);

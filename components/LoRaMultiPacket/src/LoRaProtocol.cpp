@@ -30,9 +30,20 @@ static size_t defaultFreeHeap()
 #endif
 }
 
+#ifdef LORA_PROTOCOL_HAS_RADIOLIB
 LoRaProtocol::LoRaProtocol(SX1262 *radio, RadioLibHal *hal, uint32_t irqPin, std::function<uint32_t()> randomSource)
+    : LoRaProtocol(static_cast<IRadio *>(nullptr), static_cast<IPlatform *>(nullptr), irqPin, std::move(randomSource))
+{
+  ownedRadio_ = std::make_unique<Sx1262Radio>(radio);
+  ownedPlatform_ = std::make_unique<RadioLibPlatform>(hal);
+  radio_ = ownedRadio_.get();
+  hal_ = ownedPlatform_.get();
+}
+#endif
+
+LoRaProtocol::LoRaProtocol(IRadio *radio, IPlatform *platform, uint32_t irqPin, std::function<uint32_t()> randomSource)
     : radio_(radio),
-      hal_(hal),
+      hal_(platform),
       irqPin_(irqPin),
       nodeAddress_(ADDRESS_UNASSIGNED),
       onConnRequest_(nullptr),
@@ -294,7 +305,7 @@ bool LoRaProtocol::sendUnreliable(const std::vector<Packet> &packets)
   for (const auto &packet : packets)
   {
     int state = transmitPacket(packet, "PACKET");
-    if (state != RADIOLIB_ERR_NONE)
+    if (state != RadioStatus::OK)
     {
       ESP_LOGE(TAG, "TX Failed (Chunk %u): %d", packet.header.chunkIndex, state);
       stats_.packetsTxFailed++;
@@ -332,7 +343,7 @@ bool LoRaProtocol::sendReliable(const std::vector<Packet> &packets, size_t chunk
   for (const auto &packet : packets)
   {
     int state = transmitPacket(packet, "PACKET");
-    if (state != RADIOLIB_ERR_NONE)
+    if (state != RadioStatus::OK)
     {
       ESP_LOGE(TAG, "TX Failed (Chunk %u): %d", packet.header.chunkIndex, state);
       stats_.packetsTxFailed++;
@@ -405,7 +416,7 @@ bool LoRaProtocol::sendReliable(const std::vector<Packet> &packets, size_t chunk
 
     stats_.chunksTx++;
     int state = transmitPacket(retryPkt, "RETRY PACKET");
-    if (state != RADIOLIB_ERR_NONE)
+    if (state != RadioStatus::OK)
     {
       ESP_LOGE(TAG, "Retry transmit failed: %d", state);
       stats_.packetsTxFailed++;
@@ -419,9 +430,9 @@ bool LoRaProtocol::sendReliable(const std::vector<Packet> &packets, size_t chunk
 uint32_t LoRaProtocol::calculateAckTimeoutMs(size_t totalChunks, size_t chunkPayloadSize) const
 {
   size_t maxPacketLen = HEADER_SIZE + chunkPayloadSize + CRC_SIZE;
-  uint32_t toaDataMs = radio_->getTimeOnAir(maxPacketLen) / 1000;
+  uint32_t toaDataMs = radio_->getTimeOnAirUs(maxPacketLen) / 1000;
   size_t sackLen = HEADER_SIZE + ((totalChunks + 7) / 8) + CRC_SIZE;
-  uint32_t toaSackMs = radio_->getTimeOnAir(sackLen) / 1000;
+  uint32_t toaSackMs = radio_->getTimeOnAirUs(sackLen) / 1000;
 
   // The timer starts after the burst has been sent, so it only has to cover one data frame, the turnaround
   // and the SACK (Eq. timeout in the paper), not the airtime of the whole burst.
@@ -516,7 +527,7 @@ bool LoRaProtocol::retransmitMissingChunks(const std::vector<Packet> &packets,
     pkt.calculateCRC();
 
     int state = transmitPacket(pkt, "RETRANSMIT PACKET");
-    if (state != RADIOLIB_ERR_NONE)
+    if (state != RadioStatus::OK)
     {
       ESP_LOGE(TAG, "Retransmit failed (Chunk %u): %d", idx, state);
       stats_.packetsTxFailed++;
@@ -528,8 +539,12 @@ bool LoRaProtocol::retransmitMissingChunks(const std::vector<Packet> &packets,
   return true;
 }
 
-void LoRaProtocol::update(uint32_t currentTimestampMs)
+void LoRaProtocol::update(uint32_t /*currentTimestampMs*/)
 {
+  // One time base for every timer: the platform clock also used by connect() and sendReliable() to stamp the
+  // connection, so that the inactivity check compares values from the same source.
+  const uint32_t currentTimestampMs = hal_->millis();
+
   // A session stays alive while the sender may still be repairing it: up to (R_max + 1) SACK timeouts of silence,
   // never less than PRUNE_TIMEOUT_MS.
   reassembler_.prune(currentTimestampMs,
@@ -560,7 +575,7 @@ void LoRaProtocol::update(uint32_t currentTimestampMs)
 
 std::optional<Packet> LoRaProtocol::tryReceivePacket()
 {
-  if (!hal_->digitalRead(irqPin_))
+  if (!hal_->readIrqPin(irqPin_))
   {
     return std::nullopt;
   }
@@ -571,14 +586,14 @@ std::optional<Packet> LoRaProtocol::tryReceivePacket()
     ESP_LOGI(TAG, "IRQ Pin HIGH detected! IrqFlags = 0x%04X", (unsigned)irqFlags);
   }
 
-  if (irqFlags & RADIOLIB_SX126X_IRQ_RX_DONE)
+  if (irqFlags & RadioIrq::RX_DONE)
   {
-    radio_->clearIrqFlags(RADIOLIB_SX126X_IRQ_ALL);
+    radio_->clearIrqFlags(RadioIrq::ALL);
     size_t len = radio_->getPacketLength();
     if (len > 0)
     {
       int state = radio_->readData(phyBuffer_, len);
-      if (state == RADIOLIB_ERR_NONE)
+      if (state == RadioStatus::OK)
       {
 	auto packetOpt = PacketParser::parse(phyBuffer_, len);
 	if (packetOpt.has_value())
@@ -607,7 +622,7 @@ std::optional<Packet> LoRaProtocol::tryReceivePacket()
   else
   {
     // Clear residual non-RX IRQ flags (e.g. TX_DONE) so DIO1 pin goes LOW
-    radio_->clearIrqFlags(RADIOLIB_SX126X_IRQ_ALL);
+    radio_->clearIrqFlags(RadioIrq::ALL);
     radio_->startReceive();
   }
 
@@ -779,6 +794,16 @@ void LoRaProtocol::handleIncomingPacket(const Packet &packet, uint32_t currentTi
     }
   }
 
+  // A control frame that the handshake logic above did not consume (a SYN-ACK or CONN_NACK after connect() gave up, a
+  // CONN_ACK that matches no handshake) is not application data: it must not reach the reassembler.
+  if (packet.header.flags & (FLAG_CONN_REQ | FLAG_CONN_ACK | FLAG_CONN_NACK))
+  {
+    ESP_LOGI(TAG, "Ignoring unexpected control frame (flags 0x%02X, MsgID %u) from 0x%02X",
+             (unsigned)packet.header.flags, (unsigned)msgId, (unsigned)senderAddr);
+    radio_->startReceive();
+    return;
+  }
+
   // Edge Case #3: Implicit Connection Promotion if final CONN_ACK was lost but peer started sending data
   if (connection_.state == ConnectionState::SYN_RCVD && connection_.sessionMsgId == msgId && connection_.peerAddr == senderAddr)
   {
@@ -870,7 +895,7 @@ void LoRaProtocol::sendSACK(uint8_t targetAddr, uint16_t messageId, uint8_t tota
   hal_->delay(LoRaMultiPacketConfig::SACK_PREAMBLE_GUARD_DELAY_MS);
 
   int state = transmitPacket(ackPacket, "SACK PACKET");
-  if (state != RADIOLIB_ERR_NONE)
+  if (state != RadioStatus::OK)
   {
     ESP_LOGE(TAG, "Failed to send SACK: %d", state);
   }
@@ -926,9 +951,9 @@ int LoRaProtocol::transmitPacket(const Packet &packet, const char *logPrefix)
   }
 
   int state = radio_->transmit(phyBuffer_, len);
-  radio_->clearIrqFlags(RADIOLIB_SX126X_IRQ_ALL);
+  radio_->clearIrqFlags(RadioIrq::ALL);
   radio_->startReceive();
-  if (state == RADIOLIB_ERR_NONE)
+  if (state == RadioStatus::OK)
   {
     hal_->delay(LoRaMultiPacketConfig::POST_TX_GUARD_DELAY_MS);
   }
