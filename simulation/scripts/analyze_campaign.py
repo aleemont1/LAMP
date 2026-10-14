@@ -44,6 +44,7 @@ STYLE = {
     "SWBase": ("Stop-and-Wait", "#009E73", ":", "D"),
     "SWOpt": ("Stop-and-Wait (tight timeout)", "#E69F00", ":", "P"),
     "MPLR": ("MPLR", "#CC79A7", "-.", "X"),
+    "MPLRBatch": ("MPLR ($R_{\max}$ per batch)", "#CC79A7", "-.", "X"),
     "LoRaMesher": ("LoRaMesher (10 retries)", "#7A4B2A", "--", "<"),
     "LoRaMesherTight": ("LoRaMesher (tight timeout)", "#F0E442", "-.", ">"),
     "LoRaMesherR5": ("LoRaMesher (5 retries)", "#56B4E9", "--", "h"),
