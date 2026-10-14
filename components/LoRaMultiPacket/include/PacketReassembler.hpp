@@ -86,6 +86,14 @@ class PacketReassembler
   bool isCompleted(uint8_t srcAddr, uint16_t messageId, uint32_t currentTimestampMs) const;
 
   /**
+   * @brief Sets how long a completed message keeps suppressing duplicates (default: COMPLETED_HISTORY_TTL_MS).
+   *
+   * It has to cover the sender's whole retry window, which depends on the radio settings; the protocol sets it from
+   * the SACK timeout of the largest message.
+   */
+  void setCompletedHistoryTtl(uint32_t ttlMs) { completedTtlMs_ = ttlMs; }
+
+  /**
    * @brief Marks a message from a given sender as completed, adding it to the history with its timestamp.
    */
   void markCompleted(uint8_t srcAddr, uint16_t messageId, uint32_t currentTimestampMs);
@@ -159,6 +167,7 @@ class PacketReassembler
     uint32_t completedTime;
   };
   std::vector<CompletedEntry> completedMessages_;
+  uint32_t completedTtlMs_ = LoRaMultiPacketConfig::COMPLETED_HISTORY_TTL_MS;
 
   static std::vector<uint8_t> reconstruct(const ReassemblySession &session);
 };

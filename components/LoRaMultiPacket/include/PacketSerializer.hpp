@@ -24,6 +24,13 @@ class PacketSerializer
   static void serialize(const Packet &packet, uint8_t *buffer);
 
   /**
+   * @brief Serializes a Packet into a buffer of known capacity.
+   * @return the number of bytes written, or 0 if the packet's payloadSize exceeds LORA_MAX_PAYLOAD_SIZE or the
+   *         frame (header + payload + CRC) does not fit in `capacity`. Nothing is written in that case.
+   */
+  static size_t serialize(const Packet &packet, uint8_t *buffer, size_t capacity);
+
+  /**
    * @brief Splits a raw data buffer into a vector of Packets.
    * * This method calculates the required number of chunks, sets the correct
    * Message ID, chunk indices, and control flags for each packet.

@@ -99,6 +99,23 @@ bool LoRaProtocol::connect(uint8_t targetAddress, uint32_t timeoutMs)
     return false;
   }
 
+  // One connection per node. An expired one is closed first; an established one to the same peer is reused; any other
+  // state belongs to a different peer or to a handshake in progress and must not be overwritten.
+  if (connection_.state != ConnectionState::CLOSED && connection_.inactivityExpired(hal_->millis()))
+  {
+    connection_.state = ConnectionState::CLOSED;
+  }
+  if (connection_.state == ConnectionState::ESTABLISHED && connection_.peerAddr == targetAddress)
+  {
+    return true;
+  }
+  if (connection_.state != ConnectionState::CLOSED)
+  {
+    ESP_LOGW(TAG, "connect() refused: a connection with 0x%02X is active (one connection per node)",
+             (unsigned)connection_.peerAddr);
+    return false;
+  }
+
   uint16_t msgId = allocateMessageId();
 
   connection_.state = ConnectionState::SYN_SENT;
@@ -112,14 +129,25 @@ bool LoRaProtocol::connect(uint8_t targetAddress, uint32_t timeoutMs)
   synReq.timeoutMs = static_cast<uint16_t>(LoRaMultiPacketConfig::DEFAULT_CONN_INACTIVITY_TIMEOUT_MS);
 
   ESP_LOGI(TAG, "Initiating 3-Way Handshake (MsgID %u, SYN sent to 0x%02X)...", msgId, (unsigned)targetAddress);
-  sendSyn(targetAddress, msgId, synReq);
+  if (!sendSyn(targetAddress, msgId, synReq))
+  {
+    ESP_LOGE(TAG, "3-Way Handshake Failed (SYN could not be transmitted)");
+    connection_.state = ConnectionState::CLOSED;
+    return false;
+  }
 
   SynAckMetadata synAckResp{};
-  if (!waitForSynAck(targetAddress, msgId, timeoutMs, synAckResp))
+  const SynWait wait = waitForSynAck(targetAddress, msgId, timeoutMs, synAckResp);
+  if (wait == SynWait::FAILED)
   {
     ESP_LOGE(TAG, "3-Way Handshake Failed (SYN-ACK Timeout/NACK for MsgID %u)", msgId);
     connection_.state = ConnectionState::CLOSED;
     return false;
+  }
+  if (wait == SynWait::ESTABLISHED_AS_RESPONDER)
+  {
+    ESP_LOGI(TAG, "Simultaneous open resolved: connection with 0x%02X established as responder.", (unsigned)targetAddress);
+    return true;
   }
 
   // Send final ACK of the 3-Way Handshake
@@ -134,7 +162,12 @@ bool LoRaProtocol::connect(uint8_t targetAddress, uint32_t timeoutMs)
   ackPacket.header.protocolVersion = LoRaMultiPacketConfig::PROTOCOL_VERSION;
   ackPacket.calculateCRC();
 
-  transmitPacket(ackPacket, "CONN ACK PACKET");
+  if (transmitPacket(ackPacket, "CONN ACK PACKET") != RadioStatus::OK)
+  {
+    ESP_LOGE(TAG, "3-Way Handshake Failed (final ACK could not be transmitted)");
+    connection_.state = ConnectionState::CLOSED;
+    return false;
+  }
 
   connection_.state = ConnectionState::ESTABLISHED;
   connection_.negotiatedPayloadSize = synAckResp.acceptedPayloadSize;
@@ -156,7 +189,7 @@ void LoRaProtocol::disconnect()
   }
 }
 
-void LoRaProtocol::sendSyn(uint8_t targetAddr, uint16_t msgId, const SynMetadata &syn)
+bool LoRaProtocol::sendSyn(uint8_t targetAddr, uint16_t msgId, const SynMetadata &syn)
 {
   Packet p{};
   p.header.srcAddr = nodeAddress_;
@@ -170,10 +203,10 @@ void LoRaProtocol::sendSyn(uint8_t targetAddr, uint16_t msgId, const SynMetadata
   std::memcpy(p.payload.data, &syn, sizeof(SynMetadata));
   p.calculateCRC();
 
-  transmitPacket(p, "SYN PACKET");
+  return transmitPacket(p, "SYN PACKET") == RadioStatus::OK;
 }
 
-void LoRaProtocol::sendSynAck(uint8_t targetAddr, uint16_t msgId, const SynAckMetadata &synAck)
+bool LoRaProtocol::sendSynAck(uint8_t targetAddr, uint16_t msgId, const SynAckMetadata &synAck)
 {
   Packet p{};
   p.header.srcAddr = nodeAddress_;
@@ -188,10 +221,10 @@ void LoRaProtocol::sendSynAck(uint8_t targetAddr, uint16_t msgId, const SynAckMe
   p.calculateCRC();
 
   hal_->delay(LoRaMultiPacketConfig::SACK_PREAMBLE_GUARD_DELAY_MS);
-  transmitPacket(p, "SYN-ACK PACKET");
+  return transmitPacket(p, "SYN-ACK PACKET") == RadioStatus::OK;
 }
 
-void LoRaProtocol::sendConnNack(uint8_t targetAddr, uint16_t msgId, ConnNackReason reason)
+bool LoRaProtocol::sendConnNack(uint8_t targetAddr, uint16_t msgId, ConnNackReason reason)
 {
   Packet p{};
   p.header.srcAddr = nodeAddress_;
@@ -206,12 +239,19 @@ void LoRaProtocol::sendConnNack(uint8_t targetAddr, uint16_t msgId, ConnNackReas
   p.calculateCRC();
 
   hal_->delay(LoRaMultiPacketConfig::SACK_PREAMBLE_GUARD_DELAY_MS);
-  transmitPacket(p, "CONN-NACK PACKET");
+  return transmitPacket(p, "CONN-NACK PACKET") == RadioStatus::OK;
 }
 
-bool LoRaProtocol::waitForSynAck(uint8_t targetAddr, uint16_t msgId, uint32_t timeoutMs, SynAckMetadata &synAckOut)
+static bool addressedTo(uint8_t self, const PacketHeader &h)
+{
+  return self == ADDRESS_UNASSIGNED || h.dstAddr == self;
+}
+
+LoRaProtocol::SynWait LoRaProtocol::waitForSynAck(uint8_t targetAddr, uint16_t msgId, uint32_t timeoutMs,
+                                                  SynAckMetadata &synAckOut)
 {
   uint32_t startMs = hal_->millis();
+  bool yielded = false;  // simultaneous open: we accepted the peer's SYN and wait for its final ACK instead
 
   while (hal_->millis() - startMs < timeoutMs)
   {
@@ -219,22 +259,50 @@ bool LoRaProtocol::waitForSynAck(uint8_t targetAddr, uint16_t msgId, uint32_t ti
     if (pktOpt.has_value())
     {
       const Packet &pkt = pktOpt.value();
-      if (pkt.header.messageId == msgId)
-      {
-	// Edge Case Check: Ignore responses from unexpected nodes if targetAddr is Unicast
-	if (targetAddr != ADDRESS_BROADCAST && pkt.header.srcAddr != targetAddr)
-	{
-	  ESP_LOGW(TAG, "Ignoring SYN-ACK for MsgID %u from unexpected node 0x%02X (expected 0x%02X)",
-	           msgId, (unsigned)pkt.header.srcAddr, (unsigned)targetAddr);
-	  continue;
-	}
+      const bool pureSyn = pkt.header.flags == FLAG_CONN_REQ;
 
+      if (!addressedTo(nodeAddress_, pkt.header))
+      {
+	// not for this node: a SYN-ACK or NACK meant for somebody else must not complete our handshake
+      }
+      else if (pureSyn && pkt.header.srcAddr != targetAddr)
+      {
+	handleSyn(pkt, hal_->millis());  // a third node: answered BUSY while our handshake is open
+      }
+      else if (pkt.header.srcAddr != targetAddr)
+      {
+	// other frames of other nodes are not for this wait
+      }
+      else if (yielded)
+      {
+	if (pkt.header.flags == FLAG_CONN_ACK && pkt.header.messageId == connection_.sessionMsgId)
+	{
+	  connection_.state = ConnectionState::ESTABLISHED;
+	  connection_.lastActivityMs = hal_->millis();
+	  stats_.connEstablished++;
+	  return SynWait::ESTABLISHED_AS_RESPONDER;
+	}
+      }
+      else if (pureSyn)
+      {
+	// The peer opened a connection at the same time: handleSyn() applies the tie-break. If this node yields, the
+	// SYN is accepted (state SYN_RCVD) and the peer's final ACK is awaited; if it wins, the peer is answered BUSY
+	// and our own SYN-ACK is still awaited.
+	handleSyn(pkt, hal_->millis());
+	if (connection_.state == ConnectionState::SYN_RCVD && connection_.peerAddr == targetAddr)
+	{
+	  yielded = true;
+	  startMs = hal_->millis();
+	}
+      }
+      else if (pkt.header.messageId == msgId)
+      {
 	if (pkt.header.flags & FLAG_CONN_NACK)
 	{
 	  stats_.connNacked++;
 	  ESP_LOGW(TAG, "Connection NACK received for MsgID %u (Reason code: %u)",
 	           msgId, (unsigned)pkt.payload.data[0]);
-	  return false;
+	  return SynWait::FAILED;
 	}
 
 	if ((pkt.header.flags & (FLAG_CONN_REQ | FLAG_CONN_ACK)) == (FLAG_CONN_REQ | FLAG_CONN_ACK))
@@ -248,7 +316,7 @@ bool LoRaProtocol::waitForSynAck(uint8_t targetAddr, uint16_t msgId, uint32_t ti
 	  if (pkt.header.payloadSize >= sizeof(SynAckMetadata))
 	  {
 	    std::memcpy(&synAckOut, pkt.payload.data, sizeof(SynAckMetadata));
-	    return true;
+	    return SynWait::SYN_ACK;
 	  }
 	}
       }
@@ -257,7 +325,7 @@ bool LoRaProtocol::waitForSynAck(uint8_t targetAddr, uint16_t msgId, uint32_t ti
     hal_->delay(LoRaMultiPacketConfig::POLL_SLEEP_DELAY_MS);
   }
 
-  return false;
+  return SynWait::FAILED;
 }
 
 bool LoRaProtocol::send(uint8_t targetAddress, const std::vector<uint8_t> &data, bool reliable)
@@ -460,7 +528,7 @@ bool LoRaProtocol::waitForSack(uint8_t targetAddr, uint16_t msgId, uint32_t time
     if (pktOpt.has_value())
     {
       const auto &packet = pktOpt.value();
-      if ((packet.header.flags & FLAG_ACK) && (packet.header.messageId == msgId))
+      if ((packet.header.flags & FLAG_ACK) && (packet.header.messageId == msgId) && addressedTo(nodeAddress_, packet.header))
       {
 	// Edge Case Check: Ignore SACK from unexpected nodes if targetAddr is Unicast
 	if (targetAddr != ADDRESS_BROADCAST && packet.header.srcAddr != targetAddr)
@@ -547,6 +615,12 @@ void LoRaProtocol::update(uint32_t /*currentTimestampMs*/)
 
   // A session stays alive while the sender may still be repairing it: up to (R_max + 1) SACK timeouts of silence,
   // never less than PRUNE_TIMEOUT_MS.
+  // Duplicates of a completed message can come from the sender's whole retry window, which scales with the SACK
+  // timeout of the radio settings in use: the history is kept for 1.2 x that window (never less than the default).
+  const uint32_t worstRetryWindowMs = (LoRaMultiPacketConfig::MAX_RETRIES + 1) * calculateAckTimeoutMs(255);
+  reassembler_.setCompletedHistoryTtl(
+      std::max(LoRaMultiPacketConfig::COMPLETED_HISTORY_TTL_MS, worstRetryWindowMs + worstRetryWindowMs / 5));
+
   reassembler_.prune(currentTimestampMs,
                      [this](uint8_t totalChunks)
                      {
@@ -629,6 +703,116 @@ std::optional<Packet> LoRaProtocol::tryReceivePacket()
   return std::nullopt;
 }
 
+void LoRaProtocol::handleSyn(const Packet &packet, uint32_t nowMs)
+{
+  const uint16_t msgId = packet.header.messageId;
+  const uint8_t senderAddr = packet.header.srcAddr;
+
+  stats_.synRcvd++;
+
+  // Edge Case #4: Simultaneous SYN Collision Tie-Breaking
+  if (connection_.state == ConnectionState::SYN_SENT && connection_.peerAddr == senderAddr)
+  {
+    if (nodeAddress_ < senderAddr)
+    {
+      ESP_LOGW(TAG, "Simultaneous SYN collision: Node 0x%02X wins tie-break over 0x%02X. Replying BUSY.",
+               (unsigned)nodeAddress_, (unsigned)senderAddr);
+      sendConnNack(senderAddr, msgId, ConnNackReason::BUSY);
+      return;
+    }
+    else
+    {
+      ESP_LOGI(TAG, "Simultaneous SYN collision: Node 0x%02X recedes to 0x%02X. Accepting peer SYN.",
+               (unsigned)nodeAddress_, (unsigned)senderAddr);
+    }
+  }
+  else if (connection_.state != ConnectionState::CLOSED && connection_.peerAddr != senderAddr)
+  {
+    // Failure Mode: Receiver BUSY in active session with another node
+    ESP_LOGW(TAG, "SYN rejected for MsgID %u from 0x%02X: Receiver BUSY with active session (Peer: 0x%02X)",
+             msgId, (unsigned)senderAddr, (unsigned)connection_.peerAddr);
+    sendConnNack(senderAddr, msgId, ConnNackReason::BUSY);
+    return;
+  }
+
+  // Failure Mode: Protocol Version Mismatch
+  if (packet.header.protocolVersion != LoRaMultiPacketConfig::PROTOCOL_VERSION)
+  {
+    ESP_LOGE(TAG, "SYN rejected for MsgID %u: Protocol version mismatch (%u != %u)",
+             msgId, (unsigned)packet.header.protocolVersion, (unsigned)LoRaMultiPacketConfig::PROTOCOL_VERSION);
+    sendConnNack(senderAddr, msgId, ConnNackReason::UNSUPPORTED_VERSION);
+    return;
+  }
+
+  // Failure Mode: no session slot or heap left. Answer BUSY instead of accepting a transfer we cannot hold.
+  auto admission = reassembler_.admitConnection(freeHeapProvider_());
+  if (admission != PacketReassembler::Admission::OK)
+  {
+    ESP_LOGW(TAG, "SYN rejected for MsgID %u from 0x%02X: %s", msgId, (unsigned)senderAddr,
+             admission == PacketReassembler::Admission::TABLE_FULL ? "session table full" : "not enough free heap");
+    sendConnNack(senderAddr, msgId, ConnNackReason::BUSY);
+    return;
+  }
+
+  SynMetadata synReq{};
+  if (packet.header.payloadSize >= sizeof(SynMetadata))
+  {
+    std::memcpy(&synReq, packet.payload.data, sizeof(SynMetadata));
+  }
+
+  bool accept = true;
+  if (onConnRequest_)
+  {
+    accept = onConnRequest_(synReq);
+  }
+
+  // Parameter Negotiation & Clamping (after application callback customization)
+  uint8_t acceptedPayload = synReq.requestedPayloadSize;
+  if (acceptedPayload == 0 || acceptedPayload > LORA_MAX_PAYLOAD_SIZE)
+  {
+    acceptedPayload = LORA_MAX_PAYLOAD_SIZE;  // Clamp to maximum supported payload
+  }
+
+  uint8_t acceptedWindow = (synReq.windowSize == 0) ? 1 : synReq.windowSize;
+
+  if (accept)
+  {
+    // A new connection means the sender may have restarted: its old message IDs must not be taken for duplicates
+    // and its partial sessions must not absorb the frames of the new message.
+    reassembler_.forgetSender(senderAddr);
+
+    connection_.state = ConnectionState::SYN_RCVD;
+    connection_.sessionMsgId = msgId;
+    connection_.peerAddr = senderAddr;
+    connection_.negotiatedPayloadSize = acceptedPayload;
+    connection_.windowSize = acceptedWindow;
+    connection_.lastActivityMs = nowMs;
+    // The peer proposes the inactivity timeout; it decides how long this node's only connection slot stays taken
+    // by a peer that goes silent, so it is bounded (0 = no preference).
+    uint32_t requestedTimeoutMs = (synReq.timeoutMs > 0) ? synReq.timeoutMs : LoRaMultiPacketConfig::DEFAULT_CONN_INACTIVITY_TIMEOUT_MS;
+    connection_.timeoutMs = std::min(std::max(requestedTimeoutMs, LoRaMultiPacketConfig::MIN_CONN_INACTIVITY_TIMEOUT_MS),
+                                     LoRaMultiPacketConfig::MAX_CONN_INACTIVITY_TIMEOUT_MS);
+
+    SynAckMetadata synAckResp{};
+    synAckResp.acceptedPayloadSize = acceptedPayload;
+    synAckResp.windowSize = acceptedWindow;
+    synAckResp.reserved = 0;
+
+    ESP_LOGI(TAG, "SYN received for MsgID %u from 0x%02X (ReqPayload=%uB -> AccPayload=%uB). Replying with SYN-ACK...",
+             msgId, (unsigned)senderAddr, (unsigned)synReq.requestedPayloadSize, (unsigned)acceptedPayload);
+    if (!sendSynAck(senderAddr, msgId, synAckResp))
+    {
+      ESP_LOGE(TAG, "SYN-ACK for MsgID %u could not be transmitted: connection closed", (unsigned)msgId);
+      connection_.state = ConnectionState::CLOSED;
+    }
+  }
+  else
+  {
+    ESP_LOGW(TAG, "SYN received for MsgID %u from 0x%02X but application REJECTED connection. Sending NACK.", msgId, (unsigned)senderAddr);
+    sendConnNack(senderAddr, msgId, ConnNackReason::REJECTED);
+  }
+}
+
 void LoRaProtocol::handleIncomingPacket(const Packet &packet, uint32_t currentTimestampMs)
 {
   if (verbose_)
@@ -683,101 +867,7 @@ void LoRaProtocol::handleIncomingPacket(const Packet &packet, uint32_t currentTi
   {
     if (!(packet.header.flags & FLAG_CONN_ACK))  // Pure SYN packet
     {
-      stats_.synRcvd++;
-
-      // Edge Case #4: Simultaneous SYN Collision Tie-Breaking
-      if (connection_.state == ConnectionState::SYN_SENT && connection_.peerAddr == senderAddr)
-      {
-	if (nodeAddress_ < senderAddr)
-	{
-	  ESP_LOGW(TAG, "Simultaneous SYN collision: Node 0x%02X wins tie-break over 0x%02X. Replying BUSY.",
-	           (unsigned)nodeAddress_, (unsigned)senderAddr);
-	  sendConnNack(senderAddr, msgId, ConnNackReason::BUSY);
-	  return;
-	}
-	else
-	{
-	  ESP_LOGI(TAG, "Simultaneous SYN collision: Node 0x%02X recedes to 0x%02X. Accepting peer SYN.",
-	           (unsigned)nodeAddress_, (unsigned)senderAddr);
-	}
-      }
-      else if (connection_.state != ConnectionState::CLOSED && connection_.peerAddr != senderAddr)
-      {
-	// Failure Mode: Receiver BUSY in active session with another node
-	ESP_LOGW(TAG, "SYN rejected for MsgID %u from 0x%02X: Receiver BUSY with active session (Peer: 0x%02X)",
-	         msgId, (unsigned)senderAddr, (unsigned)connection_.peerAddr);
-	sendConnNack(senderAddr, msgId, ConnNackReason::BUSY);
-	return;
-      }
-
-      // Failure Mode: Protocol Version Mismatch
-      if (packet.header.protocolVersion != LoRaMultiPacketConfig::PROTOCOL_VERSION)
-      {
-	ESP_LOGE(TAG, "SYN rejected for MsgID %u: Protocol version mismatch (%u != %u)",
-	         msgId, (unsigned)packet.header.protocolVersion, (unsigned)LoRaMultiPacketConfig::PROTOCOL_VERSION);
-	sendConnNack(senderAddr, msgId, ConnNackReason::UNSUPPORTED_VERSION);
-	return;
-      }
-
-      // Failure Mode: no session slot or heap left. Answer BUSY instead of accepting a transfer we cannot hold.
-      auto admission = reassembler_.admitConnection(freeHeapProvider_());
-      if (admission != PacketReassembler::Admission::OK)
-      {
-	ESP_LOGW(TAG, "SYN rejected for MsgID %u from 0x%02X: %s", msgId, (unsigned)senderAddr,
-	         admission == PacketReassembler::Admission::TABLE_FULL ? "session table full" : "not enough free heap");
-	sendConnNack(senderAddr, msgId, ConnNackReason::BUSY);
-	return;
-      }
-
-      SynMetadata synReq{};
-      if (packet.header.payloadSize >= sizeof(SynMetadata))
-      {
-	std::memcpy(&synReq, packet.payload.data, sizeof(SynMetadata));
-      }
-
-      bool accept = true;
-      if (onConnRequest_)
-      {
-	accept = onConnRequest_(synReq);
-      }
-
-      // Parameter Negotiation & Clamping (after application callback customization)
-      uint8_t acceptedPayload = synReq.requestedPayloadSize;
-      if (acceptedPayload == 0 || acceptedPayload > LORA_MAX_PAYLOAD_SIZE)
-      {
-	acceptedPayload = LORA_MAX_PAYLOAD_SIZE;  // Clamp to maximum supported payload
-      }
-
-      uint8_t acceptedWindow = (synReq.windowSize == 0) ? 1 : synReq.windowSize;
-
-      if (accept)
-      {
-	// A new connection means the sender may have restarted: its old message IDs must not be taken for duplicates
-	// and its partial sessions must not absorb the frames of the new message.
-	reassembler_.forgetSender(senderAddr);
-
-	connection_.state = ConnectionState::SYN_RCVD;
-	connection_.sessionMsgId = msgId;
-	connection_.peerAddr = senderAddr;
-	connection_.negotiatedPayloadSize = acceptedPayload;
-	connection_.windowSize = acceptedWindow;
-	connection_.lastActivityMs = currentTimestampMs;
-	connection_.timeoutMs = (synReq.timeoutMs > 0) ? synReq.timeoutMs : LoRaMultiPacketConfig::DEFAULT_CONN_INACTIVITY_TIMEOUT_MS;
-
-	SynAckMetadata synAckResp{};
-	synAckResp.acceptedPayloadSize = acceptedPayload;
-	synAckResp.windowSize = acceptedWindow;
-	synAckResp.reserved = 0;
-
-	ESP_LOGI(TAG, "SYN received for MsgID %u from 0x%02X (ReqPayload=%uB -> AccPayload=%uB). Replying with SYN-ACK...",
-	         msgId, (unsigned)senderAddr, (unsigned)synReq.requestedPayloadSize, (unsigned)acceptedPayload);
-	sendSynAck(senderAddr, msgId, synAckResp);
-      }
-      else
-      {
-	ESP_LOGW(TAG, "SYN received for MsgID %u from 0x%02X but application REJECTED connection. Sending NACK.", msgId, (unsigned)senderAddr);
-	sendConnNack(senderAddr, msgId, ConnNackReason::REJECTED);
-      }
+      handleSyn(packet, currentTimestampMs);
       return;
     }
   }
@@ -804,8 +894,10 @@ void LoRaProtocol::handleIncomingPacket(const Packet &packet, uint32_t currentTi
     return;
   }
 
-  // Edge Case #3: Implicit Connection Promotion if final CONN_ACK was lost but peer started sending data
-  if (connection_.state == ConnectionState::SYN_RCVD && connection_.sessionMsgId == msgId && connection_.peerAddr == senderAddr)
+  // Implicit Connection Promotion: if the final CONN_ACK was lost but the peer started sending data, the data frame
+  // proves the handshake completed. Data messages carry their own message ID, so the peer address identifies them.
+  if (connection_.state == ConnectionState::SYN_RCVD && connection_.peerAddr == senderAddr &&
+      !(packet.header.flags & FLAG_ACK))
   {
     ESP_LOGI(TAG, "Data frame received in SYN_RCVD state: Implicitly promoting connection to ESTABLISHED (MsgID %u).", msgId);
     connection_.state = ConnectionState::ESTABLISHED;
@@ -940,8 +1032,13 @@ int LoRaProtocol::transmitPacket(const Packet &packet, const char *logPrefix)
     yieldCallback_();
   }
 
-  PacketSerializer::serialize(packet, phyBuffer_);
-  size_t len = HEADER_SIZE + packet.header.payloadSize + CRC_SIZE;
+  const size_t len = PacketSerializer::serialize(packet, phyBuffer_, sizeof(phyBuffer_));
+  if (len == 0)
+  {
+    ESP_LOGE(TAG, "Refusing to transmit a frame that does not fit the PHY buffer (payloadSize=%u)",
+             (unsigned)packet.header.payloadSize);
+    return RadioStatus::FAILED;
+  }
 
   if (verbose_)
   {

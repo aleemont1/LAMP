@@ -5,18 +5,30 @@
 #include <ctime>
 #include <vector>
 
-void PacketSerializer::serialize(const Packet &packet, uint8_t *buffer)
+size_t PacketSerializer::serialize(const Packet &packet, uint8_t *buffer, size_t capacity)
 {
+  const size_t payloadSize = packet.header.payloadSize;
+  const size_t frameSize = HEADER_SIZE + payloadSize + CRC_SIZE;
+  if (buffer == nullptr || payloadSize > LORA_MAX_PAYLOAD_SIZE || frameSize > capacity)
+  {
+    return 0;
+  }
+
   // Copy header
   std::memcpy(buffer, &packet.header, HEADER_SIZE);
   // Copy payload (only the actual valid bytes)
-  if (packet.header.payloadSize > 0)
+  if (payloadSize > 0)
   {
-    std::memcpy(buffer + HEADER_SIZE, packet.payload.data, packet.header.payloadSize);
+    std::memcpy(buffer + HEADER_SIZE, packet.payload.data, payloadSize);
   }
   // Copy CRC (2 bytes) immediately after the payload
-  std::memcpy(buffer + HEADER_SIZE + packet.header.payloadSize, &packet.crc,
-              CRC_SIZE);
+  std::memcpy(buffer + HEADER_SIZE + payloadSize, &packet.crc, CRC_SIZE);
+  return frameSize;
+}
+
+void PacketSerializer::serialize(const Packet &packet, uint8_t *buffer)
+{
+  serialize(packet, buffer, MAX_TX_PACKET_SIZE);
 }
 
 std::vector<Packet> PacketSerializer::splitBufferToPackets(const uint8_t *data, size_t length, uint16_t packetNumberStart,

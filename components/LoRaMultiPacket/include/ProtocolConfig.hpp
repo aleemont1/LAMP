@@ -15,6 +15,10 @@ constexpr uint8_t PROTOCOL_VERSION = 2;
 // Connection and Handshake Configuration
 constexpr uint32_t DEFAULT_SYN_TIMEOUT_MS = 3000;
 constexpr uint32_t DEFAULT_CONN_INACTIVITY_TIMEOUT_MS = 15000;
+// Bounds applied to the inactivity timeout a peer asks for in its SYN: it decides how long the single connection slot
+// of this node stays taken by a peer that goes silent.
+constexpr uint32_t MIN_CONN_INACTIVITY_TIMEOUT_MS = 3000;
+constexpr uint32_t MAX_CONN_INACTIVITY_TIMEOUT_MS = 30000;
 
 // Retry and Timeout Limits
 constexpr int MAX_RETRIES = 5;
@@ -36,7 +40,8 @@ constexpr size_t RX_CHUNK_NODE_OVERHEAD_BYTES = 32;  // std::map node bookkeepin
 constexpr size_t RX_HEAP_MARGIN_BYTES = 16384;       // heap that must stay free for the rest of the firmware
 // How long a completed message keeps suppressing duplicates. A duplicate can only come from the sender's retry
 // window after a lost SACK: (MAX_RETRIES + 1) SACK timeouts, about 100 s for a full-size frame at SF12/125 kHz
-// (SACK timeout 16.8 s). Rounded up; raise it for narrower bandwidths or a larger MAX_RETRIES.
+// (SACK timeout 16.8 s). This is the floor: LoRaProtocol raises the TTL to 1.2 x (MAX_RETRIES + 1) SACK timeouts of the
+// largest message for the radio settings in use, so narrower bandwidths need no manual change.
 constexpr uint32_t COMPLETED_HISTORY_TTL_MS = 120000;
 
 // Airtime Safety Multipliers

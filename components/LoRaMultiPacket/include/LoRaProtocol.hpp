@@ -171,10 +171,23 @@ class LoRaProtocol
   uint16_t allocateMessageId();
 
   // Internal helper methods for 3-Way Handshake
-  void sendSyn(uint8_t targetAddr, uint16_t msgId, const SynMetadata &syn);
-  void sendSynAck(uint8_t targetAddr, uint16_t msgId, const SynAckMetadata &synAck);
-  void sendConnNack(uint8_t targetAddr, uint16_t msgId, ConnNackReason reason);
-  bool waitForSynAck(uint8_t targetAddr, uint16_t msgId, uint32_t timeoutMs, SynAckMetadata &synAckOut);
+  // The senders return false if the frame could not be transmitted.
+  bool sendSyn(uint8_t targetAddr, uint16_t msgId, const SynMetadata &syn);
+  bool sendSynAck(uint8_t targetAddr, uint16_t msgId, const SynAckMetadata &synAck);
+  bool sendConnNack(uint8_t targetAddr, uint16_t msgId, ConnNackReason reason);
+
+  /// Outcome of the wait that follows a SYN.
+  enum class SynWait : uint8_t
+  {
+    SYN_ACK,                   ///< the peer accepted our SYN; the final ACK is still to be sent
+    ESTABLISHED_AS_RESPONDER,  ///< simultaneous open: we yielded, accepted the peer's SYN and its final ACK arrived
+    FAILED                     ///< NACK, timeout or transmit failure
+  };
+  SynWait waitForSynAck(uint8_t targetAddr, uint16_t msgId, uint32_t timeoutMs, SynAckMetadata &synAckOut);
+
+  /// Handles a pure SYN: tie-break, admission, negotiation, SYN-ACK or CONN_NACK. Used by update() and, for a SYN
+  /// of the peer that arrives while connect() is waiting, by waitForSynAck().
+  void handleSyn(const Packet &packet, uint32_t nowMs);
 
   // Internal helper methods for transmission
   bool sendUnreliable(const std::vector<Packet> &packets);
