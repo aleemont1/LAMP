@@ -84,13 +84,33 @@ std::optional<ValidationError> PacketValidator::validateHeader(
 std::optional<ValidationError> PacketValidator::validateFlags(
     const PacketHeader &header)
 {
-  // CONN_ACK and CONN_NACK are mutually exclusive
-  bool hasConnAck = (header.flags & FLAG_CONN_ACK) != 0;
-  bool hasConnNack = (header.flags & FLAG_CONN_NACK) != 0;
-  if (hasConnAck && hasConnNack)
+  // Only the combinations of the protocol's flag table are defined (data, ACK_REQ, SACK, SYN, SYN-ACK, ACK, NACK).
+  // Reserved bits and any other combination are rejected, so a parser never has to guess their meaning.
+  const uint8_t f = header.flags;
+  const bool defined = f == 0x00 || f == FLAG_ACK_REQ || f == FLAG_ACK || f == FLAG_CONN_REQ ||
+                       f == (FLAG_CONN_REQ | FLAG_CONN_ACK) || f == FLAG_CONN_ACK || f == FLAG_CONN_NACK;
+  if (!defined)
   {
-    return ValidationError(ValidationError::Type::INVALID_FLAGS,
-                           "CONN_ACK and CONN_NACK cannot both be set");
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "Undefined flag combination 0x%02X", (unsigned)f);
+    return ValidationError(ValidationError::Type::INVALID_FLAGS, buf);
+  }
+
+  // Control frames are single frames: SACK, SYN, SYN-ACK, ACK and NACK all carry totalChunks = 1, chunkIndex = 0.
+  const bool control = (f & (FLAG_ACK | FLAG_CONN_REQ | FLAG_CONN_ACK | FLAG_CONN_NACK)) != 0;
+  if (control && (header.totalChunks != 1 || header.chunkIndex != 0))
+  {
+    return ValidationError(ValidationError::Type::INVALID_FLAGS, "Control frame must have totalChunks = 1, chunkIndex = 0");
+  }
+
+  // The final ACK of the handshake has no payload; a SACK carries a bitmap of 1..ceil(255 / 8) bytes.
+  if (f == FLAG_CONN_ACK && header.payloadSize != 0)
+  {
+    return ValidationError(ValidationError::Type::INVALID_FLAGS, "Handshake ACK must not carry a payload");
+  }
+  if (f == FLAG_ACK && (header.payloadSize < 1 || header.payloadSize > 32))
+  {
+    return ValidationError(ValidationError::Type::INVALID_FLAGS, "SACK bitmap must be 1..32 bytes");
   }
 
   return std::nullopt;
