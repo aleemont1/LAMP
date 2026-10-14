@@ -67,7 +67,7 @@ struct ModeSpec {
     bool threeWay = true;                    // third message (ACK) of the handshake
     bool teardown = false;                   // FIN/ACK/FIN/ACK after the last acknowledgment
     uint32_t batchSize = 0;                  // BATCH_BVACK: packets per batch
-    bool batchBudget = false;                // BATCH_BVACK: repair budget renewed by every clean batch
+    bool batchBudget = false;                // BATCH_BVACK: R_max per batch of new frames instead of per transfer
     uint32_t maxRetries = MAX_RETRIES;       // repair-round budget (or per-chunk retries, stop-and-wait)
     double fixedTimeoutMs = 0.0;             // > 0: stop-and-wait timeout fixed by the library
 };
@@ -415,8 +415,8 @@ public:
     void HandleBatchTimeout()
     {
         if (!m_running || m_state != STATE_WAIT_SACK) return;
-        if (m_budgetRounds >= m_spec.maxRetries) { Finish(false); return; }
-        m_rounds++; m_budgetRounds++;
+        if (m_rounds >= BudgetLimit()) { Finish(false); return; }
+        m_rounds++;
         size_t pos = m_batch.size() - 1;
         Time onAir = SendFrame(FLAG_ACK_REQ, m_batch[pos], m_batch.size(), {}, ChunkLen(m_batch[pos]), m_batchId, pos);
         m_chunksTx++;
@@ -435,12 +435,11 @@ public:
             bool got = (pos / 8 < bitmap.size()) && (bitmap[pos / 8] & (1 << (pos % 8)));
             if (!got) m_retx.push_back(m_batch[pos]);
         }
-        if (m_retx.empty() && m_spec.batchBudget) m_budgetRounds = 0;  // a clean batch renews the budget
         if (m_retx.empty() && m_nextNew >= m_totalChunks) { StartTeardown(); return; }
         if (!m_retx.empty())
         {
-            if (m_budgetRounds >= m_spec.maxRetries) { Finish(false); return; }
-            m_rounds++; m_budgetRounds++;
+            if (m_rounds >= BudgetLimit()) { Finish(false); return; }
+            m_rounds++;
         }
         StartBatch();
     }
@@ -641,9 +640,15 @@ public:
     uint32_t m_swCur = 0;
     uint32_t m_swRetries = 0;
     uint32_t m_synRetries = 0;
+    // MPLR repair budget: R_max for the whole transfer or, for "MPLRBatch", R_max for each batch of new frames
+    // (pooled: the transfer may spend R_max rounds per batch it needs).
+    uint32_t BudgetLimit() const
+    {
+        if (!m_spec.batchBudget) return m_spec.maxRetries;
+        return m_spec.maxRetries * ((m_totalChunks + m_spec.batchSize - 1) / m_spec.batchSize);
+    }
     bool m_pollMissing = false;  // timeout poll: re-send the last chunk repaired instead of chunk N-1
     uint32_t m_lastPoll = 0;
-    uint32_t m_budgetRounds = 0;     // rounds counted against R_max
     double m_lossAckProb = 0.0;      // acknowledgment frames (SACK/ACK, SYN-ACK) lost on their way to the sender
     uint32_t m_rounds = 0;      // repair rounds used (timeouts + SACK-with-gaps, or stop-and-wait retries)
     bool m_senderOk = false;
