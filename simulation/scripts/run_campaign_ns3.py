@@ -98,6 +98,43 @@ def jobs_C():
         yield (f"C_loss{p}", 100.0, mode, sf, "LOS", seed, ["--sigma=0", "--m=50", f"--loss={p / 100}"])
 
 
+MODES_F = ["Mode3", "Mode4", "SWBase", "MPLR", "MPLRBatch", "LoRaMesher", "LoRaMesherR5"]
+NS_F = [20, 50, 100, 255]   # chunks of 244 B: 4.9 kB ... 62.2 kB (MPLR batches of 40, LoRaMesher 211 B frames)
+SNRS_F = list(range(-18, -3)) + [5]
+
+
+def jobs_F():
+    """Message size sweep, SF7: static SNR axis and the Urban distance axis, same seeds as Blocks A and B.
+    MPLR keeps R_max for the whole transfer; MPLRBatch renews it after every clean batch."""
+    for n in NS_F:
+        for snr, mode, seed in itertools.product(SNRS_F, MODES_F, SEEDS):
+            yield (f"F_N{n}_STATIC", distance_for_snr(snr, *FREE_SPACE), mode, 7, "LOS", seed,
+                   ["--sigma=0", "--m=50", f"--chunks={n}"])
+        env, ch_n, pl1km, extra = CHANNELS_B["URBAN"]
+        for snr, mode, seed in itertools.product(SNRS, MODES_F, SEEDS):
+            d = distance_for_snr(snr, ch_n, pl1km)
+            if d <= MAX_DIST_M:
+                yield (f"F_N{n}_URBAN", d, mode, 7, env, seed, [*extra, f"--chunks={n}"])
+
+
+LOSS_G = [0, 10, 20, 30, 40, 50]
+
+
+def jobs_G(poll=0):
+    """Loss of acknowledgments (SACK/ACK, SYN-ACK) on top of the bench's data/handshake-frame loss, SF7.
+    poll=1 re-sends, on a timeout, the last chunk repaired instead of chunk N-1 (Block H)."""
+    for p, pa, mode, seed in itertools.product(LOSS_G, LOSS_G, ["Mode3", "Mode4"] if poll else ["Mode3", "Mode4", "SWBase"], SEEDS):
+        yield (f"{'H' if poll else 'G'}_loss{p}_ack{pa}", 100.0, mode, 7, "LOS", seed,
+               ["--sigma=0", "--m=50", f"--loss={p / 100}", f"--lossAck={pa / 100}"] + (["--pollMissing=1"] if poll else []))
+
+
+def jobs_H():
+    yield from jobs_G(poll=1)
+    for snr, mode, seed in itertools.product(range(-18, -8), ["Mode3", "Mode4"], SEEDS):
+        yield ("H_STATIC", distance_for_snr(snr, *FREE_SPACE), mode, 7, "LOS", seed,
+               ["--sigma=0", "--m=50", "--pollMissing=1"])
+
+
 def run(job):
     label, d, mode, sf, env, seed, extra = job
     cmd = [BIN, f"--distance={d:.3f}", f"--mode={mode}", f"--sf={sf}", f"--env={env}", f"--seed={seed}", *extra]
@@ -139,3 +176,9 @@ if __name__ == "__main__":
         campaign("D", jobs_D(), limit)
     if "E" in which:
         campaign("E", jobs_E(), limit)
+    if "F" in which:
+        campaign("F", jobs_F(), limit)
+    if "G" in which:
+        campaign("G", jobs_G(), limit)
+    if "H" in which:
+        campaign("H", jobs_H(), limit)
