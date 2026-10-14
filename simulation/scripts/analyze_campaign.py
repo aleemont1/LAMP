@@ -193,6 +193,13 @@ def main():
                    f"B_pdr_distance_{label}_related.png", x="dist_km", xlabel="Distance (km)", modes=RELATED,
                    ylim=(-2, 102), zoom="tail", ref=90, height=2.7)
 
+    if B["mode"].isin(["MPLR"]).any():
+        for label in ["URBAN", "RURAL", "WATER"]:
+            panels(B[B.label == label], "pdr", "PDR$_{app}$ (%)",
+                   f"{label}: LAMP and related protocols, payload delivery ratio vs distance (95 % CI)",
+                   f"B_pdr_distance_{label}_related.png", x="dist_km", xlabel="Distance (km)", modes=RELATED,
+                   ylim=(-2, 102))
+
     # --- Summary tables ---------------------------------------------------------------------------
     rows = []
     for (sf, m), d in A.groupby(["sf", "mode"]):
